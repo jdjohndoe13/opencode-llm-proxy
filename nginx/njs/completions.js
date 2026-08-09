@@ -60,6 +60,7 @@ function completions(r) {
 function streamSse(r, reply, uri) {
     const raw = reply.responseText;
     if (raw === undefined || raw === null || raw === '') {
+        r.status = 200;
         r.headersOut['Content-Type'] = 'text/event-stream';
         r.headersOut['Cache-Control'] = 'no-cache';
         r.sendHeader();
@@ -76,6 +77,7 @@ function streamSse(r, reply, uri) {
         return;
     }
 
+    r.status = 200;
     r.headersOut['Content-Type'] = 'text/event-stream';
     r.headersOut['Cache-Control'] = 'no-cache';
     r.sendHeader();
