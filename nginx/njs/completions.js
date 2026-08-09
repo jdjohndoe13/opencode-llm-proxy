@@ -222,19 +222,23 @@ function emitToolCallDeltas(r, base, call, index) {
     }
 }
 
+// Matches the tag prefix used by the backend's tool-call markup: an optional
+// run of ASCII/fullwidth vertical bars around an optional literal "DSML",
+// e.g. <tool_calls>, <|tool_calls|>, <\uFF5CDSML\uFF5Ctool_calls>.
+const TAG_PREFIX_OPEN = '<\\s*[|\\uFF5C]*\\s*(?:DSML)?\\s*[|\\uFF5C]*\\s*';
+const TAG_PREFIX_CLOSE = '<\\/\\s*[|\\uFF5C]*\\s*(?:DSML)?\\s*[|\\uFF5C]*\\s*';
+
 // Parses tool-call markup from a string, e.g.
 //   <tool_calls>\n<invoke name="bash">\n<parameter name="command" string="true">ls</parameter>\n</invoke>\n</tool_calls>
 // into calls of the form {id: null, name, arguments} where arguments is a JSON
-// string of the parameters. The tag separator may be an ASCII or fullwidth
-// vertical bar (|<|\uFF5C>), which the backend commonly emits. Unknown markup
-// is left untouched.
+// string of the parameters. Unknown markup is left untouched.
 function extractToolCalls(text) {
     const calls = [];
-    const re = /<[|\uFF5C]*\s*invoke\s+name="([^"]*)"[^>]*>([\s\S]*?)<\/[|\uFF5C]*\s*invoke>/g;
+    const re = new RegExp(TAG_PREFIX_OPEN + 'invoke\\s+name="([^"]*)"[^>]*>([\\s\\S]*?)' + TAG_PREFIX_CLOSE + 'invoke[|\\uFF5C]*>', 'g');
     let m;
     while ((m = re.exec(text)) !== null) {
         const params = {};
-        const pre = /<[|\uFF5C]*\s*parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)<\/[|\uFF5C]*\s*parameter>/g;
+        const pre = new RegExp(TAG_PREFIX_OPEN + 'parameter\\s+name="([^"]*)"[^>]*>([\\s\\S]*?)' + TAG_PREFIX_CLOSE + 'parameter[|\\uFF5C]*>', 'g');
         let pm;
         while ((pm = pre.exec(m[2])) !== null) {
             params[pm[1]] = pm[2];
@@ -250,12 +254,12 @@ function extractToolCalls(text) {
 function stripToolCalls(text) {
     const calls = [];
     let t = text;
-    t = t.replace(/<[|\uFF5C]*\s*tool_calls>[\s\S]*?<\/[|\uFF5C]*\s*tool_calls>/g, function (block) {
+    t = t.replace(new RegExp(TAG_PREFIX_OPEN + 'tool_calls[|\\uFF5C]*>[\\s\\S]*?' + TAG_PREFIX_CLOSE + 'tool_calls[|\\uFF5C]*>', 'g'), function (block) {
         const found = extractToolCalls(block);
         for (let i = 0; i < found.length; i++) calls.push(found[i]);
         return '';
     });
-    t = t.replace(/<[|\uFF5C]*\s*invoke\s+name="[^"]*"[^>]*>[\s\S]*?<\/[|\uFF5C]*\s*invoke>/g, function (block) {
+    t = t.replace(new RegExp(TAG_PREFIX_OPEN + 'invoke\\s+name="[^"]*"[^>]*>[\\s\\S]*?' + TAG_PREFIX_CLOSE + 'invoke[|\\uFF5C]*>', 'g'), function (block) {
         const found = extractToolCalls(block);
         for (let i = 0; i < found.length; i++) calls.push(found[i]);
         return '';

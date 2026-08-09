@@ -171,6 +171,13 @@ docker compose up -d --force-recreate
   the deltas reproduces the original text exactly. There is no realtime
   token-by-token timing; the events are emitted as soon as the buffered
   upstream response arrives.
+- Tool calls are preserved: when the non-streaming response carries
+  `message.tool_calls`, or contains tool-call markup (`<tool_calls>` /
+  `<invoke name=...>`, also in the `DSML` special-token form
+  `<\uFF5CDSML\uFF5C...>` that the vLLM backend leaves inside `reasoning`
+  when `stream=false`), the converter strips the markup and emits OpenAI-style
+  `delta.tool_calls` events with `finish_reason: "tool_calls"`, matching what
+  a real streaming response would look like.
 - Invalid or empty JSON bodies on a rewritten endpoint return `400`.
 - The `Host` header sent to the backend is the `LLM_BACKEND` address (not the
   original client `Host`), which is fine for LLM backends that don't use
