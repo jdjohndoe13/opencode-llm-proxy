@@ -93,12 +93,14 @@ function streamSse(r, reply, uri) {
 
 // Emits a chat.completion response as chat.completion.chunk SSE events,
 // mirroring the upstream streaming format: role delta, reasoning deltas,
-// content deltas, a finish_reason delta, an (optional) usage event, then
-// [DONE].
+// content deltas, tool_calls deltas, a finish_reason delta, an (optional)
+// usage event, then [DONE]. Tool calls are taken from message.tool_calls if
+// present, otherwise parsed out of opencode-style <tool_calls>/<invoke>
+// markup that the backend may leave inside reasoning/content.
 function emitChatStream(r, obj) {
     const choice = (obj.choices && obj.choices.length) ? obj.choices[0] : null;
     const msg = choice ? choice.message : null;
-    const finishReason = choice && choice.finish_reason ? choice.finish_reason : 'stop';
+    let finishReason = choice && choice.finish_reason ? choice.finish_reason : 'stop';
     const base = {
         id: obj.id,
         object: 'chat.completion.chunk',
@@ -117,18 +119,45 @@ function emitChatStream(r, obj) {
     if (obj.prompt_text !== undefined) first.prompt_text = obj.prompt_text;
     r.send('data: ' + JSON.stringify(first) + '\n\n');
 
-    if (msg && msg.reasoning) {
-        const parts = splitText(msg.reasoning, CHUNK_SIZE);
+    const calls = [];
+    let reasoning = msg && msg.reasoning ? String(msg.reasoning) : '';
+    let content = msg && msg.content ? String(msg.content) : '';
+
+    if (msg && Array.isArray(msg.tool_calls)) {
+        for (let i = 0; i < msg.tool_calls.length; i++) {
+            const tc = msg.tool_calls[i];
+            calls.push({
+                id: tc.id || null,
+                name: tc.function ? tc.function.name : null,
+                arguments: tc.function ? tc.function.arguments : '',
+            });
+        }
+    }
+    const strippedR = stripToolCalls(reasoning);
+    reasoning = strippedR.text;
+    for (let i = 0; i < strippedR.calls.length; i++) calls.push(strippedR.calls[i]);
+    const strippedC = stripToolCalls(content);
+    content = strippedC.text;
+    for (let i = 0; i < strippedC.calls.length; i++) calls.push(strippedC.calls[i]);
+
+    if (calls.length > 0) finishReason = 'tool_calls';
+
+    if (reasoning) {
+        const parts = splitText(reasoning, CHUNK_SIZE);
         for (let i = 0; i < parts.length; i++) {
             r.send('data: ' + JSON.stringify(chatDelta(base, { reasoning: parts[i] })) + '\n\n');
         }
     }
 
-    if (msg && msg.content) {
-        const parts = splitText(msg.content, CHUNK_SIZE);
+    if (content) {
+        const parts = splitText(content, CHUNK_SIZE);
         for (let i = 0; i < parts.length; i++) {
             r.send('data: ' + JSON.stringify(chatDelta(base, { content: parts[i] })) + '\n\n');
         }
+    }
+
+    for (let i = 0; i < calls.length; i++) {
+        emitToolCallDeltas(r, base, calls[i], i);
     }
 
     const done = {
@@ -154,6 +183,93 @@ function emitChatStream(r, obj) {
     }
 
     r.send('data: [DONE]\n\n');
+}
+
+// Emits one tool call as OpenAI-style delta.tool_calls events: a first event
+// carrying id/type/function.name, then one event per arguments fragment.
+function emitToolCallDeltas(r, base, call, index) {
+    const id = call.id || ('call_' + randomHex(24));
+    const first = {
+        id: base.id,
+        object: 'chat.completion.chunk',
+        created: base.created,
+        model: base.model,
+        choices: [{
+            index: 0,
+            delta: { content: null, tool_calls: [{ id: id, type: 'function', index: index, function: { name: call.name, arguments: '' } }] },
+            logprobs: null,
+            finish_reason: null,
+        }],
+    };
+    r.send('data: ' + JSON.stringify(first) + '\n\n');
+
+    const args = call.arguments || '';
+    const parts = splitText(args, CHUNK_SIZE);
+    for (let i = 0; i < parts.length; i++) {
+        const d = {
+            id: base.id,
+            object: 'chat.completion.chunk',
+            created: base.created,
+            model: base.model,
+            choices: [{
+                index: 0,
+                delta: { content: null, tool_calls: [{ id: null, type: null, index: index, function: { name: null, arguments: parts[i] } }] },
+                logprobs: null,
+                finish_reason: null,
+            }],
+        };
+        r.send('data: ' + JSON.stringify(d) + '\n\n');
+    }
+}
+
+// Parses tool-call markup from a string, e.g.
+//   <tool_calls>\n<invoke name="bash">\n<parameter name="command" string="true">ls</parameter>\n</invoke>\n</tool_calls>
+// into calls of the form {id: null, name, arguments} where arguments is a JSON
+// string of the parameters. The tag separator may be an ASCII or fullwidth
+// vertical bar (|<|\uFF5C>), which the backend commonly emits. Unknown markup
+// is left untouched.
+function extractToolCalls(text) {
+    const calls = [];
+    const re = /<[|\uFF5C]*\s*invoke\s+name="([^"]*)"[^>]*>([\s\S]*?)<\/[|\uFF5C]*\s*invoke>/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const params = {};
+        const pre = /<[|\uFF5C]*\s*parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)<\/[|\uFF5C]*\s*parameter>/g;
+        let pm;
+        while ((pm = pre.exec(m[2])) !== null) {
+            params[pm[1]] = pm[2];
+        }
+        calls.push({ id: null, name: m[1], arguments: JSON.stringify(params) });
+    }
+    return calls;
+}
+
+// Removes tool-call markup from a string and returns {text, calls}: text is
+// the input with <tool_calls>...</tool_calls> and bare <invoke>...</invoke>
+// blocks removed (trimmed), calls is the list of parsed tool calls.
+function stripToolCalls(text) {
+    const calls = [];
+    let t = text;
+    t = t.replace(/<[|\uFF5C]*\s*tool_calls>[\s\S]*?<\/[|\uFF5C]*\s*tool_calls>/g, function (block) {
+        const found = extractToolCalls(block);
+        for (let i = 0; i < found.length; i++) calls.push(found[i]);
+        return '';
+    });
+    t = t.replace(/<[|\uFF5C]*\s*invoke\s+name="[^"]*"[^>]*>[\s\S]*?<\/[|\uFF5C]*\s*invoke>/g, function (block) {
+        const found = extractToolCalls(block);
+        for (let i = 0; i < found.length; i++) calls.push(found[i]);
+        return '';
+    });
+    return { text: t.replace(/\s+$/g, ''), calls: calls };
+}
+
+// Generates a lowercase hex string of the given length.
+function randomHex(len) {
+    let s = '';
+    for (let i = 0; i < len; i++) {
+        s += '0123456789abcdef'.charAt(Math.floor(Math.random() * 16));
+    }
+    return s;
 }
 
 // Builds a chat.completion.chunk with a non-empty delta.
