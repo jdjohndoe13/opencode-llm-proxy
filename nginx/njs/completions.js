@@ -2,8 +2,9 @@ const SKIP_RESPONSE_HEADERS = ['content-length', 'connection', 'keep-alive', 'tr
 
 export default { completions };
 
-// Rewrites /v1/completions requests: sets top_p=0.95 and stream=false in the
-// JSON request body, then forwards the modified body to the backend.
+// Rewrites /v1/completions and /v1/chat/completions requests: sets
+// top_p=0.95 and stream=false in the JSON request body, then forwards the
+// modified body to the backend at the same path.
 function completions(r) {
     const raw = r.requestText;
     if (raw === undefined || raw === null || raw === '') {
@@ -23,7 +24,7 @@ function completions(r) {
     obj.stream = false;
     const newBody = JSON.stringify(obj);
 
-    r.subrequest('/_completions', {
+    r.subrequest('/_completions' + r.uri, {
         method: r.method,
         body: newBody,
         args: r.variables.args,
