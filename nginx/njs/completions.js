@@ -22,6 +22,7 @@ function completions(r) {
 
     obj.top_p = 0.95;
     obj.stream = false;
+    delete obj["stream_options"]
     const newBody = JSON.stringify(obj);
 
     r.subrequest('/_completions' + r.uri, {
