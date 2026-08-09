@@ -7,7 +7,9 @@ export default { completions };
 
 // Rewrites /v1/completions and /v1/chat/completions requests: sets
 // top_p=0.95 and stream=false in the JSON request body, then forwards the
-// modified body to the backend at the same path.
+// modified body to the backend at the same path. When the client requested
+// stream=true, the (always non-streaming) backend response is converted into
+// a single-message SSE stream.
 function completions(r) {
     const raw = r.requestText;
     const ts = Date.now();
@@ -26,6 +28,7 @@ function completions(r) {
         return;
     }
 
+    const wantStream = obj.stream === true;
     obj.top_p = 0.95;
     obj.stream = false;
     delete obj["stream_options"]
@@ -38,6 +41,12 @@ function completions(r) {
     }, function (reply) {
         dump(r, ts, 'resp', reply.responseText);
         copyHeaders(r, reply);
+        if (reply.status === 200 && wantStream) {
+            r.headersOut['Content-Type'] = 'text/event-stream';
+            r.headersOut['Cache-Control'] = 'no-cache';
+            r.return(200, 'data: ' + reply.responseText + '\n\n' + 'data: [DONE]\n\n');
+            return;
+        }
         r.return(reply.status, reply.responseText);
     });
 }
