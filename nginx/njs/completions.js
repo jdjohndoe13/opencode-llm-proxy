@@ -1,4 +1,7 @@
+const fs = require('fs');
+
 const SKIP_RESPONSE_HEADERS = ['content-length', 'connection', 'keep-alive', 'transfer-encoding', 'content-encoding'];
+const LOG_DIR = '/var/log/nginx/completions';
 
 export default { completions };
 
@@ -7,10 +10,13 @@ export default { completions };
 // modified body to the backend at the same path.
 function completions(r) {
     const raw = r.requestText;
+    const ts = Date.now();
     if (raw === undefined || raw === null || raw === '') {
         r.return(400, 'empty request body');
         return;
     }
+
+    dump(r, ts, 'req', raw);
 
     let obj;
     try {
@@ -30,9 +36,23 @@ function completions(r) {
         body: newBody,
         args: r.variables.args,
     }, function (reply) {
+        dump(r, ts, 'resp', reply.responseText);
         copyHeaders(r, reply);
         r.return(reply.status, reply.responseText);
     });
+}
+
+// Writes a request/response dump to LOG_DIR/<unix-ms>.<kind>.json. Dumping
+// must never break the proxy path, so write errors are only logged.
+function dump(r, ts, kind, data) {
+    if (data === undefined || data === null) {
+        return;
+    }
+    try {
+        fs.writeFileSync(LOG_DIR + '/' + ts + '.' + kind + '.json', data);
+    } catch (e) {
+        r.error('failed to write ' + kind + ' dump: ' + e);
+    }
 }
 
 // Pass upstream response headers through to the client (Content-Length and
