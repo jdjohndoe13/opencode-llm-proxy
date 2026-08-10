@@ -1,0 +1,40 @@
+server {
+    listen 9999;
+
+    # Required: arms the client read event so ngx.on_abort fires when the
+    # client disconnects while the upstream call is in flight.
+    lua_check_client_abort on;
+
+    # Large enough for long LLM prompts and (non-streamed) completions.
+    client_max_body_size 100m;
+    client_body_buffer_size 100m;
+
+    # Backend address used by the Lua cosocket handler.
+    set $llm_backend ${LLM_BACKEND};
+
+    # /v1/completions and /v1/chat/completions: rewrite the JSON request body
+    # (top_p=0.95, stream=false) and forward it to the backend, converting the
+    # non-streaming response into SSE when the client requested streaming. The
+    # upstream connection is closed as soon as the client disconnects.
+    location ~ ^/v1/(chat/)?completions$ {
+        access_by_lua_block {
+            ngx.req.read_body()
+        }
+        content_by_lua_block {
+            require("completions").completions()
+        }
+    }
+
+    # Everything else: transparent proxy to the same backend.
+    location / {
+        proxy_pass http://${LLM_BACKEND};
+        proxy_http_version 1.1;
+        proxy_set_header Host ${LLM_BACKEND};
+        proxy_set_header Connection "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}

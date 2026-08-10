@@ -1,0 +1,22 @@
+services:
+  nginx-lua:
+    image: openresty/openresty:alpine
+    container_name: llm-proxy-lua
+    restart: unless-stopped
+    ports:
+      - "9999:9999"
+    environment:
+      LLM_BACKEND: host.docker.internal:21025
+    volumes:
+      - ./nginx/lua/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./nginx/lua/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/lua:/etc/nginx/lua:ro
+      - ./logs:/var/log/nginx/completions
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /var/log/nginx/completions /etc/nginx/conf.d &&
+        chown nobody:nobody /var/log/nginx/completions &&
+        sed 's/\$${LLM_BACKEND}/'"$$LLM_BACKEND"'/g' /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf &&
+        /usr/local/openresty/bin/openresty -g 'daemon off;'
