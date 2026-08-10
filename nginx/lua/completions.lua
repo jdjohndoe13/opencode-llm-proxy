@@ -286,7 +286,7 @@ local function emit_chat_stream(obj)
     if obj.usage ~= nil then
         local usage = {
             id = obj.id, object = "chat.completion.chunk", created = obj.created, model = obj.model,
-            choices = {}, usage = obj.usage,
+            choices = cjson.empty_array, usage = obj.usage,
         }
         if obj.system_fingerprint ~= nil then usage.system_fingerprint = obj.system_fingerprint end
         sse(cjson.encode(usage))
