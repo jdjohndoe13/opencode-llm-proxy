@@ -17,6 +17,38 @@ local CHUNK_SIZE = 16
 local POLL_MS = 1000
 local HEX = "0123456789abcdef"
 
+-- GPU temperature monitor. The endpoint returns a JSON object mapping GPU
+-- names to temperatures, e.g. {"gpu_0":48,"gpu_1":49,...}. The address is
+-- taken from the TEMP_ENDPOINT environment variable (a full URL to the
+-- /temperatures endpoint, e.g. http://host.docker.internal:18082/temperatures),
+-- falling back to that default when unset. The proxy stalls (stops forwarding
+-- to the upstream) while any temperature is above STALL_ABOVE and only resumes
+-- once every temperature is below RESUME_BELOW (hysteresis so the machine has
+-- time to cool down).
+local STALL_ABOVE = 75
+local RESUME_BELOW = 65
+local TEMP_POLL_INTERVAL = 1.0  -- seconds between temperature checks
+local TEMP_CACHE_TTL = 0.9      -- seconds a cached snapshot is considered fresh
+local TEMP_HTTP_TIMEOUT = 5000  -- ms for the cosocket temperature request
+
+-- Splits a full endpoint URL into (host, port, path). Returns nil when the
+-- URL is missing or malformed.
+local function parse_temp_endpoint(url)
+    local rest = (url or ""):gsub("^https?://", "")
+    if rest == "" then return nil end
+    local hostport, path = rest:match("^([^/]+)(/.*)$")
+    if not hostport then hostport, path = rest, "/" end
+    local host, port = hostport:match("^(.*):(%d+)$")
+    if not host then host, port = hostport, "80" end
+    return host, port, path
+end
+
+local TEMP_ENDPOINT = ngx.var.temp_endpoint
+if not TEMP_ENDPOINT or TEMP_ENDPOINT == "" then
+    TEMP_ENDPOINT = "http://host.docker.internal:18082/temperatures"
+end
+local TEMP_HOST, TEMP_PORT, TEMP_PATH = parse_temp_endpoint(TEMP_ENDPOINT)
+
 math.randomseed(math.floor(ngx.now() * 1000) + ngx.worker.pid())
 
 local _M = {}
@@ -403,6 +435,160 @@ local function receive_until_close_poll(sock, state)
     return table.concat(parts)
 end
 
+-- Fetches the current GPU temperatures from the monitor endpoint over a
+-- cosocket. Returns a list of numeric temperatures, or nil on any failure.
+local function fetch_temperatures()
+    local sock = ngx.socket.tcp()
+    sock:settimeout(TEMP_HTTP_TIMEOUT)
+    local ok, err = sock:connect(TEMP_HOST, TEMP_PORT)
+    if not ok then
+        ngx.log(ngx.ERR, "temperature endpoint connect failed: " .. tostring(err))
+        return nil
+    end
+    local req = "GET " .. TEMP_PATH .. " HTTP/1.1\r\n"
+        .. "Host: " .. TEMP_HOST .. ":" .. TEMP_PORT .. "\r\n"
+        .. "Connection: close\r\n\r\n"
+    local _, werr = sock:send(req)
+    if werr then
+        sock:close()
+        return nil
+    end
+
+    local status_line = sock:receive("*l")
+    if not status_line then
+        sock:close()
+        return nil
+    end
+    local status = tonumber(status_line:match("^HTTP/%d+%.?%d*%s+(%d+)"))
+    local content_length
+    local chunked = false
+    while true do
+        local line = sock:receive("*l")
+        if not line or line == "" then break end
+        local name, value = line:match("^([^:]+):%s*(.*)$")
+        if name then
+            local lname = string.lower(name)
+            if lname == "content-length" then content_length = tonumber(value) end
+            if lname == "transfer-encoding" and value:lower():find("chunked", 1, true) then chunked = true end
+        end
+    end
+
+    local body = ""
+    if chunked then
+        while true do
+            local size_line = sock:receive("*l")
+            if not size_line then break end
+            local size = tonumber(size_line:match("^%x+"))
+            if not size or size == 0 then break end
+            local data = sock:receive(size)
+            if not data then break end
+            body = body .. data
+            sock:receive(2)
+        end
+    elseif content_length then
+        local data = sock:receive(content_length)
+        if data then body = data end
+    else
+        while true do
+            local data, rerr = sock:receive(4096)
+            if not data then break end
+            body = body .. data
+        end
+    end
+    sock:close()
+
+    if status ~= 200 then
+        ngx.log(ngx.ERR, "temperature endpoint returned status " .. tostring(status))
+        return nil
+    end
+    local okj, obj = pcall(cjson.decode, body)
+    if not okj or type(obj) ~= "table" then
+        ngx.log(ngx.ERR, "temperature endpoint returned invalid JSON")
+        return nil
+    end
+    local temps = {}
+    for _, v in pairs(obj) do
+        if type(v) == "number" then temps[#temps + 1] = v end
+    end
+    if #temps == 0 then
+        ngx.log(ngx.ERR, "temperature endpoint returned no numeric values")
+        return nil
+    end
+    return temps
+end
+
+-- Stores the highest observed temperature in the shared dict so concurrent
+-- requests/workers reuse one snapshot instead of each hammering the monitor.
+local function update_temp_cache(temps)
+    local max = 0
+    for i = 1, #temps do
+        if temps[i] > max then max = temps[i] end
+    end
+    local d = ngx.shared.temps
+    if d then
+        d:set("max_temp", max)
+        d:set("checked_at", ngx.now())
+    end
+    return max
+end
+
+-- Returns (max_temp, checked_at) from the shared cache when the snapshot is
+-- still fresh, otherwise (nil, nil) so the caller fetches a new one.
+local function read_temp_cache()
+    local d = ngx.shared.temps
+    if not d then return nil, nil end
+    local max = d:get("max_temp")
+    local checked_at = d:get("checked_at")
+    if not max or not checked_at then return nil, nil end
+    if ngx.now() - checked_at > TEMP_CACHE_TTL then return nil, nil end
+    return max, checked_at
+end
+
+-- Stalls the request until every GPU temperature is safely below RESUME_BELOW.
+-- If any temperature is above STALL_ABOVE the request is not forwarded to the
+-- upstream and we keep polling the monitor (at most once per second, shared
+-- across all requests) until everything cools down. If the monitor cannot be
+-- reached the proxy conservatively keeps stalling. Returns true when it is
+-- safe to proceed, false if the client disconnected while waiting.
+local function wait_for_cool_down(state)
+    local stalled = false
+    while true do
+        if state.aborted then return false end
+
+        local max = read_temp_cache()
+        if not max then
+            local temps = fetch_temperatures()
+            if not temps then
+                ngx.log(ngx.ERR, "temperature check failed; conservatively stalling request")
+                stalled = true
+            else
+                max = update_temp_cache(temps)
+            end
+        end
+
+        if max then
+            if stalled then
+                if max < RESUME_BELOW then
+                    ngx.log(ngx.NOTICE, "GPU cooled to " .. max .. " (<" .. RESUME_BELOW .. "), resuming request")
+                    return true
+                end
+            elseif max > STALL_ABOVE then
+                ngx.log(ngx.NOTICE, "GPU temperature " .. max .. " > " .. STALL_ABOVE .. ", stalling request")
+                stalled = true
+            else
+                return true
+            end
+        end
+
+        -- Wait one poll interval, waking periodically to notice client aborts.
+        local deadline = ngx.now() + TEMP_POLL_INTERVAL
+        while ngx.now() < deadline do
+            if state.aborted then return false end
+            ngx.sleep(0.2)
+        end
+    end
+end
+
 function _M.completions()
     ngx.req.read_body()
     local raw = ngx.req.get_body_data()
@@ -428,6 +614,29 @@ function _M.completions()
     obj.stream_options = nil
     local new_body = cjson.encode(obj)
 
+    -- Register the abort handler before the cool-down stall so a client
+    -- disconnect during the stall (or while waiting for the upstream) is
+    -- noticed. The callback runs in a separate light thread, so it must only
+    -- set a flag: the cosocket is owned by the handler coroutine and cannot be
+    -- closed from here ("socket busy reading"). The handler polls the flag
+    -- with short socket timeouts and closes the upstream socket itself.
+    local state = { aborted = false }
+    local okab, ab_err = ngx.on_abort(function()
+        state.aborted = true
+        ngx.log(ngx.WARN, "client aborted while waiting for upstream")
+    end)
+    if not okab then
+        ngx.log(ngx.ERR, "failed to register abort handler: " .. tostring(ab_err))
+    end
+
+    -- Cool-down guard: while any GPU temperature is above STALL_ABOVE, do not
+    -- forward the request to the upstream. Keep polling the monitor (about
+    -- once per second) until every temperature drops below RESUME_BELOW.
+    if not wait_for_cool_down(state) then
+        ngx.log(ngx.INFO, "client aborted while stalling for cool-down")
+        return ngx.exit(444)
+    end
+
     local path = ngx.var.uri
     local args = ngx.var.args
     if args and args ~= "" then path = path .. "?" .. args end
@@ -439,19 +648,6 @@ function _M.completions()
     end
 
     local sock = ngx.socket.tcp()
-    local state = { aborted = false }
-    -- The abort callback runs in a separate light thread, so it must only set
-    -- a flag: the cosocket is owned by the handler coroutine and cannot be
-    -- closed from here ("socket busy reading"). The handler polls the flag
-    -- with short socket timeouts and closes the upstream socket itself.
-    local okab, ab_err = ngx.on_abort(function()
-        state.aborted = true
-        ngx.log(ngx.WARN, "client aborted while waiting for upstream")
-    end)
-    if not okab then
-        ngx.log(ngx.ERR, "failed to register abort handler: " .. tostring(ab_err))
-    end
-
     sock:settimeout(POLL_MS)
 
     local okc, cerr = sock:connect(host, tonumber(port))

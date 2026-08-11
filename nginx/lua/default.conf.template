@@ -12,6 +12,10 @@ server {
     # Backend address used by the Lua cosocket handler.
     set $llm_backend ${LLM_BACKEND};
 
+    # GPU temperature monitor endpoint (full URL, substituted from
+    # TEMP_ENDPOINT at startup, read by the Lua handler via ngx.var).
+    set $temp_endpoint ${TEMP_ENDPOINT};
+
     # /v1/completions and /v1/chat/completions: rewrite the JSON request body
     # (top_p=0.95, stream=false) and forward it to the backend, converting the
     # non-streaming response into SSE when the client requested streaming. The
