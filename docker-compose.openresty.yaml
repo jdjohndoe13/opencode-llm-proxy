@@ -8,8 +8,8 @@ services:
     environment:
       LLM_BACKEND: host.docker.internal:21025
       TEMP_ENDPOINT: "http://host.docker.internal:18082/temperatures"
-      STALL_ABOVE: "75"
-      RESUME_BELOW: "65"
+      STALL_ABOVE: "72"
+      RESUME_BELOW: "60"
       TEMP_POLL_INTERVAL: "1.0"
       TEMP_CACHE_TTL: "0.9"
       TEMP_HTTP_TIMEOUT: "5000"
