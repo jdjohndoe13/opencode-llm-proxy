@@ -18,18 +18,31 @@ local POLL_MS = 1000
 local HEX = "0123456789abcdef"
 
 -- GPU temperature monitor. The endpoint returns a JSON object mapping GPU
--- names to temperatures, e.g. {"gpu_0":48,"gpu_1":49,...}. The address is
--- taken from the TEMP_ENDPOINT environment variable (a full URL to the
--- /temperatures endpoint, e.g. http://host.docker.internal:18082/temperatures),
--- falling back to that default when unset. The proxy stalls (stops forwarding
--- to the upstream) while any temperature is above STALL_ABOVE and only resumes
--- once every temperature is below RESUME_BELOW (hysteresis so the machine has
--- time to cool down).
-local STALL_ABOVE = 75
-local RESUME_BELOW = 65
-local TEMP_POLL_INTERVAL = 1.0  -- seconds between temperature checks
-local TEMP_CACHE_TTL = 0.9      -- seconds a cached snapshot is considered fresh
-local TEMP_HTTP_TIMEOUT = 5000  -- ms for the cosocket temperature request
+-- names to temperatures, e.g. {"gpu_0":48,"gpu_1":49,...}. The proxy stalls
+-- (stops forwarding to the upstream) while any temperature is above
+-- STALL_ABOVE and only resumes once every temperature is below RESUME_BELOW
+-- (hysteresis so the machine has time to cool down).
+--
+-- Every tuning value is injected from the environment into the nginx config
+-- as a `set $var` directive (see default.conf.template) and read back here
+-- via ngx.var. There are deliberately no defaults: the container refuses to
+-- start when a variable is missing, and the checks below fail loaded requests
+-- if one ever slips through.
+
+local function require_var(name, v)
+    if not v or v == "" then
+        error("missing configuration variable " .. name .. " (set it in docker-compose.openresty.yaml)", 2)
+    end
+    return v
+end
+
+local function require_number(name, v)
+    local n = tonumber(require_var(name, v))
+    if not n then
+        error("invalid numeric value for " .. name .. ": " .. tostring(v), 2)
+    end
+    return n
+end
 
 -- Splits a full endpoint URL into (host, port, path). Returns nil when the
 -- URL is missing or malformed.
@@ -43,11 +56,18 @@ local function parse_temp_endpoint(url)
     return host, port, path
 end
 
-local TEMP_ENDPOINT = ngx.var.temp_endpoint
-if not TEMP_ENDPOINT or TEMP_ENDPOINT == "" then
-    TEMP_ENDPOINT = "http://host.docker.internal:18082/temperatures"
-end
+local TEMP_ENDPOINT = require_var("temp_endpoint", ngx.var.temp_endpoint)
+local STALL_ABOVE = require_number("stall_above", ngx.var.stall_above)
+local RESUME_BELOW = require_number("resume_below", ngx.var.resume_below)
+local TEMP_POLL_INTERVAL = require_number("temp_poll_interval", ngx.var.temp_poll_interval)
+local TEMP_CACHE_TTL = require_number("temp_cache_ttl", ngx.var.temp_cache_ttl)
+local TEMP_HTTP_TIMEOUT = require_number("temp_http_timeout", ngx.var.temp_http_timeout)
+local STALL_LOG = require_var("stall_log", ngx.var.stall_log)
+
 local TEMP_HOST, TEMP_PORT, TEMP_PATH = parse_temp_endpoint(TEMP_ENDPOINT)
+if not TEMP_HOST then
+    error("invalid temp_endpoint URL, expected http://host:port/path: " .. tostring(TEMP_ENDPOINT), 2)
+end
 
 math.randomseed(math.floor(ngx.now() * 1000) + ngx.worker.pid())
 
@@ -560,6 +580,7 @@ local function wait_for_cool_down(state)
             local temps = fetch_temperatures()
             if not temps then
                 ngx.log(ngx.ERR, "temperature check failed; conservatively stalling request")
+                if not ngx.ctx._stall_start then ngx.ctx._stall_start = ngx.now() end
                 stalled = true
             else
                 max = update_temp_cache(temps)
@@ -569,10 +590,12 @@ local function wait_for_cool_down(state)
         if max then
             if stalled then
                 if max < RESUME_BELOW then
+                    ngx.ctx._stall_end = ngx.now()
                     ngx.log(ngx.NOTICE, "GPU cooled to " .. max .. " (<" .. RESUME_BELOW .. "), resuming request")
                     return true
                 end
             elseif max > STALL_ABOVE then
+                if not ngx.ctx._stall_start then ngx.ctx._stall_start = ngx.now() end
                 ngx.log(ngx.NOTICE, "GPU temperature " .. max .. " > " .. STALL_ABOVE .. ", stalling request")
                 stalled = true
             else
@@ -590,6 +613,9 @@ local function wait_for_cool_down(state)
 end
 
 function _M.completions()
+    ngx.ctx._start = ngx.now()
+    ngx.ctx._uri = ngx.var.uri
+
     ngx.req.read_body()
     local raw = ngx.req.get_body_data()
     if not raw or raw == "" then
@@ -623,6 +649,7 @@ function _M.completions()
     local state = { aborted = false }
     local okab, ab_err = ngx.on_abort(function()
         state.aborted = true
+        ngx.ctx._aborted = true
         ngx.log(ngx.WARN, "client aborted while waiting for upstream")
     end)
     if not okab then
@@ -786,6 +813,43 @@ function _M.completions()
     end
 
     return ngx.exit(ngx.HTTP_OK)
+end
+
+-- Runs in the log phase (after the response has been fully sent) and writes
+-- one JSON line per request to STALL_LOG, e.g:
+--   {"time":"...","ts":...,"uri":"/v1/completions","status":200,"aborted":false,"total_s":1.234,"stall_s":0.0}
+-- Tooling can sum total_s (time from incoming to last byte returned) and
+-- stall_s (time spent waiting for the GPUs to cool down) across all lines.
+function _M.log_request()
+    local c = ngx.ctx
+    local ended = ngx.now()
+    local start = c._start or ended
+
+    local entry = {
+        time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        ts = start,
+        uri = c._uri or ngx.var.uri,
+        status = ngx.status,
+        aborted = c._aborted == true,
+        total_s = math.floor((ended - start) * 1000 + 0.5) / 1000,
+    }
+
+    if c._stall_start then
+        local stall_end = c._stall_end or ended
+        entry.stall_start = c._stall_start
+        entry.stall_end = stall_end
+        entry.stall_s = math.floor((stall_end - c._stall_start) * 1000 + 0.5) / 1000
+    else
+        entry.stall_s = 0
+    end
+
+    local f, err = io.open(STALL_LOG, "a")
+    if not f then
+        ngx.log(ngx.ERR, "failed to open stall log " .. STALL_LOG .. ": " .. tostring(err))
+        return
+    end
+    f:write(cjson.encode(entry) .. "\n")
+    f:close()
 end
 
 return _M

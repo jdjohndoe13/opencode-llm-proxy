@@ -16,6 +16,16 @@ server {
     # TEMP_ENDPOINT at startup, read by the Lua handler via ngx.var).
     set $temp_endpoint ${TEMP_ENDPOINT};
 
+    # GPU temperature monitor tuning. Every value is injected from the
+    # environment at startup (no defaults: the container refuses to start
+    # when a variable is missing).
+    set $stall_above ${STALL_ABOVE};
+    set $resume_below ${RESUME_BELOW};
+    set $temp_poll_interval ${TEMP_POLL_INTERVAL};
+    set $temp_cache_ttl ${TEMP_CACHE_TTL};
+    set $temp_http_timeout ${TEMP_HTTP_TIMEOUT};
+    set $stall_log ${STALL_LOG};
+
     # /v1/completions and /v1/chat/completions: rewrite the JSON request body
     # (top_p=0.95, stream=false) and forward it to the backend, converting the
     # non-streaming response into SSE when the client requested streaming. The
@@ -26,6 +36,9 @@ server {
         }
         content_by_lua_block {
             require("completions").completions()
+        }
+        log_by_lua_block {
+            require("completions").log_request()
         }
     }
 
