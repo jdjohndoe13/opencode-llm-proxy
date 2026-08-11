@@ -26,6 +26,13 @@ server {
     set $temp_http_timeout ${TEMP_HTTP_TIMEOUT};
     set $stall_log ${STALL_LOG};
 
+    # Keep-alive heartbeat for streaming clients: fake empty SSE chunks start
+    # KEEPALIVE_DELAY seconds after the request was received and repeat every
+    # KEEPALIVE_INTERVAL seconds until the upstream response arrives, so
+    # clients with first-byte timeouts don't abort the stream.
+    set $keepalive_delay ${KEEPALIVE_DELAY};
+    set $keepalive_interval ${KEEPALIVE_INTERVAL};
+
     # /v1/completions and /v1/chat/completions: rewrite the JSON request body
     # (top_p=0.95, stream=false) and forward it to the backend, converting the
     # non-streaming response into SSE when the client requested streaming. The

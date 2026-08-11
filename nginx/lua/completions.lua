@@ -64,6 +64,14 @@ local TEMP_CACHE_TTL = require_number("temp_cache_ttl", ngx.var.temp_cache_ttl)
 local TEMP_HTTP_TIMEOUT = require_number("temp_http_timeout", ngx.var.temp_http_timeout)
 local STALL_LOG = require_var("stall_log", ngx.var.stall_log)
 
+-- Keep-alive heartbeat for streaming clients: fake empty SSE chunks start
+-- emitting KEEPALIVE_DELAY seconds after the request was fully received and
+-- repeat every KEEPALIVE_INTERVAL seconds until the upstream response
+-- arrives, so clients with a first-byte timeout shorter than the backend
+-- latency don't abort the stream.
+local KEEPALIVE_DELAY = require_number("keepalive_delay", ngx.var.keepalive_delay)
+local KEEPALIVE_INTERVAL = require_number("keepalive_interval", ngx.var.keepalive_interval)
+
 local TEMP_HOST, TEMP_PORT, TEMP_PATH = parse_temp_endpoint(TEMP_ENDPOINT)
 if not TEMP_HOST then
     error("invalid temp_endpoint URL, expected http://host:port/path: " .. tostring(TEMP_ENDPOINT), 2)
@@ -250,6 +258,45 @@ local function sse(data)
     flush_print("data: " .. data .. "\n\n")
 end
 
+-- Relays an upstream failure to a streaming client: since the SSE handshake
+-- was already sent, the error can no longer be a plain HTTP status, so it is
+-- sent as an SSE event followed by [DONE].
+local function sse_error(message)
+    sse(cjson.encode({ error = { message = message, type = "upstream_error" } }))
+end
+
+-- Emits fake empty SSE chunks while the upstream response is still pending,
+-- so clients whose first-byte timeout is shorter than the backend latency do
+-- not abort the stream. No-op unless the SSE handshake was already sent and
+-- the keep-alive window (KEEPALIVE_DELAY) or cadence (KEEPALIVE_INTERVAL) is
+-- due. The chunks mirror the upstream chunk shape with an empty delta/text.
+local function send_keepalive()
+    if not ngx.ctx._sse_started then return end
+    local req_done = ngx.ctx._req_done
+    if not req_done then return end
+    local now = ngx.now()
+    if now - req_done < KEEPALIVE_DELAY then return end
+    local last = ngx.ctx._last_keepalive or req_done
+    if now - last < KEEPALIVE_INTERVAL then return end
+    ngx.ctx._last_keepalive = now
+
+    local chunk
+    if ngx.ctx._keepalive_chat then
+        chunk = {
+            id = ngx.ctx._keepalive_id, object = "chat.completion.chunk",
+            created = ngx.ctx._keepalive_created, model = ngx.ctx._keepalive_model,
+            choices = { { index = 0, delta = {}, logprobs = ngx.null, finish_reason = ngx.null } },
+        }
+    else
+        chunk = {
+            id = ngx.ctx._keepalive_id, object = "text_completion",
+            created = ngx.ctx._keepalive_created, model = ngx.ctx._keepalive_model,
+            choices = { { index = 0, text = "", logprobs = ngx.null, finish_reason = ngx.null, stop_reason = ngx.null } },
+        }
+    end
+    sse(cjson.encode(chunk))
+end
+
 local function chat_delta(base, delta)
     return {
         id = base.id, object = "chat.completion.chunk", created = base.created, model = base.model,
@@ -388,16 +435,19 @@ end
 -- Abort-aware reads: use the short poll timeout and return nil, "aborted"
 -- when the client disconnected while waiting, so the handler coroutine
 -- (which owns the cosocket) can close the upstream connection itself.
-local function recv_line_poll(sock, state)
+-- on_wait, when given, is called on every receive timeout so the caller can
+-- keep the client's first-byte timeout at bay (e.g. emit keep-alive chunks).
+local function recv_line_poll(sock, state, on_wait)
     while true do
         if state.aborted then return nil, "aborted" end
         local line, err = sock:receive("*l")
         if line then return line, nil end
         if err ~= "timeout" then return nil, err end
+        if on_wait then on_wait() end
     end
 end
 
-local function recv_bytes_poll(sock, n, state)
+local function recv_bytes_poll(sock, n, state, on_wait)
     local parts = {}
     local got = 0
     while got < n do
@@ -408,36 +458,38 @@ local function recv_bytes_poll(sock, n, state)
             got = got + #data
         elseif err ~= "timeout" then
             return nil, err
+        elseif on_wait then
+            on_wait()
         end
     end
     return table.concat(parts)
 end
 
-local function receive_chunked_poll(sock, state)
+local function receive_chunked_poll(sock, state, on_wait)
     local parts = {}
     while true do
         if state.aborted then return nil, "aborted" end
-        local line, err = recv_line_poll(sock, state)
+        local line, err = recv_line_poll(sock, state, on_wait)
         if not line then return nil, err end
         local size = tonumber(line:match("^%x+"))
         if not size then return nil, "bad chunk size" end
         if size == 0 then
             while true do
-                local tl, terr = recv_line_poll(sock, state)
+                local tl, terr = recv_line_poll(sock, state, on_wait)
                 if not tl then break end
                 if tl == "" then break end
             end
             break
         end
-        local chunk, cerr = recv_bytes_poll(sock, size, state)
+        local chunk, cerr = recv_bytes_poll(sock, size, state, on_wait)
         if not chunk then return nil, cerr end
         parts[#parts + 1] = chunk
-        recv_bytes_poll(sock, 2, state)
+        recv_bytes_poll(sock, 2, state, on_wait)
     end
     return table.concat(parts)
 end
 
-local function receive_until_close_poll(sock, state)
+local function receive_until_close_poll(sock, state, on_wait)
     local parts = {}
     while true do
         if state.aborted then return nil, "aborted" end
@@ -445,7 +497,8 @@ local function receive_until_close_poll(sock, state)
         if data then
             parts[#parts + 1] = data
         elseif err == "timeout" then
-            -- keep polling the abort flag
+            -- keep polling the abort flag / keep-alive cadence
+            if on_wait then on_wait() end
         elseif err == "closed" then
             break
         else
@@ -603,10 +656,12 @@ local function wait_for_cool_down(state)
             end
         end
 
-        -- Wait one poll interval, waking periodically to notice client aborts.
+        -- Wait one poll interval, waking periodically to notice client aborts
+        -- and to keep streaming clients fed with keep-alive chunks.
         local deadline = ngx.now() + TEMP_POLL_INTERVAL
         while ngx.now() < deadline do
             if state.aborted then return false end
+            send_keepalive()
             ngx.sleep(0.2)
         end
     end
@@ -617,6 +672,7 @@ function _M.completions()
     ngx.ctx._uri = ngx.var.uri
 
     ngx.req.read_body()
+    ngx.ctx._req_done = ngx.now() -- "last byte of the request" moment, base of the keep-alive schedule
     local raw = ngx.req.get_body_data()
     if not raw or raw == "" then
         ngx.status = ngx.HTTP_BAD_REQUEST
@@ -640,6 +696,12 @@ function _M.completions()
     obj.stream_options = nil
     local new_body = cjson.encode(obj)
 
+    -- Keep-alive context for streaming clients (see send_keepalive).
+    ngx.ctx._keepalive_chat = ngx.var.uri:find("/chat/", 1, true) ~= nil
+    ngx.ctx._keepalive_id = (type(obj.id) == "string" and obj.id ~= "") and obj.id or "chatcmpl-keepalive"
+    ngx.ctx._keepalive_model = type(obj.model) == "string" and obj.model or "unknown"
+    ngx.ctx._keepalive_created = math.floor(ngx.now())
+
     -- Register the abort handler before the cool-down stall so a client
     -- disconnect during the stall (or while waiting for the upstream) is
     -- noticed. The callback runs in a separate light thread, so it must only
@@ -654,6 +716,18 @@ function _M.completions()
     end)
     if not okab then
         ngx.log(ngx.ERR, "failed to register abort handler: " .. tostring(ab_err))
+    end
+
+    -- Streaming clients: commit to the SSE handshake up front, before the
+    -- cool-down stall and the upstream call, so keep-alive chunks can flow
+    -- while the backend is still generating. A later upstream failure is then
+    -- relayed as an SSE error event instead of a plain HTTP status.
+    if want_stream then
+        ngx.status = ngx.HTTP_OK
+        ngx.header["Content-Type"] = "text/event-stream"
+        ngx.header["Cache-Control"] = "no-cache"
+        ngx.send_headers()
+        ngx.ctx._sse_started = true
     end
 
     -- Cool-down guard: while any GPU temperature is above STALL_ABOVE, do not
@@ -680,6 +754,11 @@ function _M.completions()
     local okc, cerr = sock:connect(host, tonumber(port))
     if not okc then
         ngx.log(ngx.ERR, "connect to " .. backend .. " failed: " .. tostring(cerr))
+        if want_stream then
+            sse_error("upstream connect failed: " .. tostring(cerr))
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
         return ngx.exit(ngx.HTTP_BAD_GATEWAY)
     end
 
@@ -709,10 +788,15 @@ function _M.completions()
         end
         ngx.log(ngx.ERR, "failed to send request to " .. backend .. ": " .. tostring(werr))
         sock:close()
+        if want_stream then
+            sse_error("upstream send failed: " .. tostring(werr))
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
         return ngx.exit(ngx.HTTP_BAD_GATEWAY)
     end
 
-    local status_line, sl_err = recv_line_poll(sock, state)
+    local status_line, sl_err = recv_line_poll(sock, state, send_keepalive)
     if not status_line then
         if state.aborted then
             ngx.log(ngx.INFO, "client aborted, closing upstream connection")
@@ -721,6 +805,11 @@ function _M.completions()
         end
         ngx.log(ngx.ERR, "failed to read status line from " .. backend .. ": " .. tostring(sl_err))
         sock:close()
+        if want_stream then
+            sse_error("upstream error: " .. tostring(sl_err))
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
         return ngx.exit(ngx.HTTP_BAD_GATEWAY)
     end
 
@@ -730,7 +819,7 @@ function _M.completions()
     local chunked = false
     while true do
         if state.aborted then break end
-        local line, herr = recv_line_poll(sock, state)
+        local line, herr = recv_line_poll(sock, state, send_keepalive)
         if not line then break end
         if line == "" then break end
         local name, value = line:match("^([^:]+):%s*(.*)$")
@@ -748,11 +837,11 @@ function _M.completions()
 
     local body, err
     if chunked then
-        body, err = receive_chunked_poll(sock, state)
+        body, err = receive_chunked_poll(sock, state, send_keepalive)
     elseif content_length then
-        body, err = recv_bytes_poll(sock, content_length, state)
+        body, err = recv_bytes_poll(sock, content_length, state, send_keepalive)
     else
-        body, err = receive_until_close_poll(sock, state)
+        body, err = receive_until_close_poll(sock, state, send_keepalive)
     end
 
     if state.aborted then
@@ -766,31 +855,43 @@ function _M.completions()
 
     if not body then
         ngx.log(ngx.ERR, "failed to read response body from " .. backend .. ": " .. tostring(err))
+        if want_stream then
+            sse_error("upstream read failed: " .. tostring(err))
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
         return ngx.exit(ngx.HTTP_BAD_GATEWAY)
     end
 
     dump(ts, "resp", body)
 
-    ngx.status = status
-    ngx.header["Content-Type"] = headers["content-type"] or "application/json"
-    if headers["cache-control"] then ngx.header["Cache-Control"] = headers["cache-control"] end
+    if want_stream then
+        -- The SSE handshake was already sent; a non-200 upstream result is
+        -- relayed as an SSE event so the client's parser still gets a stream.
+        if status ~= 200 then
+            if body == "" then
+                sse_error("upstream returned status " .. tostring(status))
+            else
+                sse(body)
+            end
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
+        if body == "" then
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
+    else
+        ngx.status = status
+        ngx.header["Content-Type"] = headers["content-type"] or "application/json"
+        if headers["cache-control"] then ngx.header["Cache-Control"] = headers["cache-control"] end
 
-    if status ~= 200 then
+        if status ~= 200 then
+            ngx.print(body)
+            return ngx.exit(ngx.HTTP_OK)
+        end
+
         ngx.print(body)
-        return ngx.exit(ngx.HTTP_OK)
-    end
-
-    if not want_stream then
-        ngx.print(body)
-        return ngx.exit(ngx.HTTP_OK)
-    end
-
-    ngx.header["Content-Type"] = "text/event-stream"
-    ngx.header["Cache-Control"] = "no-cache"
-    ngx.send_headers()
-
-    if body == "" then
-        sse("[DONE]")
         return ngx.exit(ngx.HTTP_OK)
     end
 
