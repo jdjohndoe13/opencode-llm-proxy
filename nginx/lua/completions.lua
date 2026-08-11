@@ -267,17 +267,28 @@ end
 
 -- Emits fake empty SSE chunks while the upstream response is still pending,
 -- so clients whose first-byte timeout is shorter than the backend latency do
--- not abort the stream. No-op unless the SSE handshake was already sent and
--- the keep-alive window (KEEPALIVE_DELAY) or cadence (KEEPALIVE_INTERVAL) is
--- due. The chunks mirror the upstream chunk shape with an empty delta/text.
+-- not abort the stream. The SSE handshake itself is deferred until the first
+-- keep-alive chunk is due (KEEPALIVE_DELAY after the request was received):
+-- as long as the upstream answers before that, a non-200 result can still be
+-- relayed as a plain HTTP error instead of an SSE event. No-op for
+-- non-streaming requests. The chunks mirror the upstream chunk shape with an
+-- empty delta/text.
 local function send_keepalive()
-    if not ngx.ctx._sse_started then return end
+    if not ngx.ctx._want_stream then return end
     local req_done = ngx.ctx._req_done
     if not req_done then return end
     local now = ngx.now()
-    if now - req_done < KEEPALIVE_DELAY then return end
-    local last = ngx.ctx._last_keepalive or req_done
-    if now - last < KEEPALIVE_INTERVAL then return end
+    if not ngx.ctx._sse_started then
+        if now - req_done < KEEPALIVE_DELAY then return end
+        ngx.status = ngx.HTTP_OK
+        ngx.header["Content-Type"] = "text/event-stream"
+        ngx.header["Cache-Control"] = "no-cache"
+        ngx.send_headers()
+        ngx.ctx._sse_started = true
+    else
+        local last = ngx.ctx._last_keepalive or req_done
+        if now - last < KEEPALIVE_INTERVAL then return end
+    end
     ngx.ctx._last_keepalive = now
 
     local chunk
@@ -697,6 +708,7 @@ function _M.completions()
     local new_body = cjson.encode(obj)
 
     -- Keep-alive context for streaming clients (see send_keepalive).
+    ngx.ctx._want_stream = want_stream
     ngx.ctx._keepalive_chat = ngx.var.uri:find("/chat/", 1, true) ~= nil
     ngx.ctx._keepalive_id = (type(obj.id) == "string" and obj.id ~= "") and obj.id or "chatcmpl-keepalive"
     ngx.ctx._keepalive_model = type(obj.model) == "string" and obj.model or "unknown"
@@ -718,17 +730,11 @@ function _M.completions()
         ngx.log(ngx.ERR, "failed to register abort handler: " .. tostring(ab_err))
     end
 
-    -- Streaming clients: commit to the SSE handshake up front, before the
-    -- cool-down stall and the upstream call, so keep-alive chunks can flow
-    -- while the backend is still generating. A later upstream failure is then
-    -- relayed as an SSE error event instead of a plain HTTP status.
-    if want_stream then
-        ngx.status = ngx.HTTP_OK
-        ngx.header["Content-Type"] = "text/event-stream"
-        ngx.header["Cache-Control"] = "no-cache"
-        ngx.send_headers()
-        ngx.ctx._sse_started = true
-    end
+    -- Streaming clients: the SSE handshake is deferred until the first
+    -- keep-alive chunk is due (KEEPALIVE_DELAY after the request was
+    -- received, see send_keepalive). While the upstream answers within that
+    -- window, non-200 results are relayed as plain HTTP errors; only once the
+    -- handshake has gone out is a later failure sent as an SSE error event.
 
     -- Cool-down guard: while any GPU temperature is above STALL_ABOVE, do not
     -- forward the request to the upstream. Keep polling the monitor (about
@@ -754,7 +760,7 @@ function _M.completions()
     local okc, cerr = sock:connect(host, tonumber(port))
     if not okc then
         ngx.log(ngx.ERR, "connect to " .. backend .. " failed: " .. tostring(cerr))
-        if want_stream then
+        if ngx.ctx._sse_started then
             sse_error("upstream connect failed: " .. tostring(cerr))
             sse("[DONE]")
             return ngx.exit(ngx.HTTP_OK)
@@ -788,7 +794,7 @@ function _M.completions()
         end
         ngx.log(ngx.ERR, "failed to send request to " .. backend .. ": " .. tostring(werr))
         sock:close()
-        if want_stream then
+        if ngx.ctx._sse_started then
             sse_error("upstream send failed: " .. tostring(werr))
             sse("[DONE]")
             return ngx.exit(ngx.HTTP_OK)
@@ -805,7 +811,7 @@ function _M.completions()
         end
         ngx.log(ngx.ERR, "failed to read status line from " .. backend .. ": " .. tostring(sl_err))
         sock:close()
-        if want_stream then
+        if ngx.ctx._sse_started then
             sse_error("upstream error: " .. tostring(sl_err))
             sse("[DONE]")
             return ngx.exit(ngx.HTTP_OK)
@@ -855,7 +861,7 @@ function _M.completions()
 
     if not body then
         ngx.log(ngx.ERR, "failed to read response body from " .. backend .. ": " .. tostring(err))
-        if want_stream then
+        if ngx.ctx._sse_started then
             sse_error("upstream read failed: " .. tostring(err))
             sse("[DONE]")
             return ngx.exit(ngx.HTTP_OK)
@@ -865,9 +871,10 @@ function _M.completions()
 
     dump(ts, "resp", body)
 
-    if want_stream then
-        -- The SSE handshake was already sent; a non-200 upstream result is
-        -- relayed as an SSE event so the client's parser still gets a stream.
+    if want_stream and ngx.ctx._sse_started then
+        -- The SSE handshake was already sent (the upstream took longer than
+        -- KEEPALIVE_DELAY); a non-200 result is relayed as an SSE event so
+        -- the client's parser still gets a stream.
         if status ~= 200 then
             if body == "" then
                 sse_error("upstream returned status " .. tostring(status))
@@ -891,8 +898,21 @@ function _M.completions()
             return ngx.exit(ngx.HTTP_OK)
         end
 
-        ngx.print(body)
-        return ngx.exit(ngx.HTTP_OK)
+        if not want_stream then
+            ngx.print(body)
+            return ngx.exit(ngx.HTTP_OK)
+        end
+
+        ngx.status = ngx.HTTP_OK
+        ngx.header["Content-Type"] = "text/event-stream"
+        ngx.header["Cache-Control"] = "no-cache"
+        ngx.send_headers()
+        ngx.ctx._sse_started = true
+
+        if body == "" then
+            sse("[DONE]")
+            return ngx.exit(ngx.HTTP_OK)
+        end
     end
 
     local okj, jobj = pcall(cjson.decode, body)

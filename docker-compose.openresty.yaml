@@ -14,10 +14,12 @@ services:
       TEMP_CACHE_TTL: "0.9"
       TEMP_HTTP_TIMEOUT: "5000"
       STALL_LOG: "/var/log/nginx/completions/stall.log"
-      # Keep-alive heartbeat for streaming clients: fake empty SSE chunks start
-      # KEEPALIVE_DELAY seconds after the request was received and repeat every
-      # KEEPALIVE_INTERVAL seconds until the upstream response arrives.
-      KEEPALIVE_DELAY: "3"
+      # Keep-alive heartbeat for streaming clients: fake empty SSE chunks (and
+      # the SSE handshake) start only KEEPALIVE_DELAY seconds after the request
+      # was received, then repeat every KEEPALIVE_INTERVAL seconds until the
+      # upstream response arrives. The delay gives fast upstream errors a
+      # window to come back as plain HTTP errors before the stream commits.
+      KEEPALIVE_DELAY: "30"
       KEEPALIVE_INTERVAL: "5"
     volumes:
       - ./nginx/lua/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
