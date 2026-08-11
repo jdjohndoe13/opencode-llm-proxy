@@ -23,8 +23,12 @@ local _M = {}
 
 -- ngx.null is a truthy lightuserdata (tostring(ngx.null) == "userdata: NULL"),
 -- so treat it like nil when reading optional backend fields.
+local function is_null(v)
+    return v == nil or v == ngx.null
+end
+
 local function field_str(v)
-    if v == nil or v == ngx.null then return "" end
+    if is_null(v) then return "" end
     return tostring(v)
 end
 
@@ -240,8 +244,8 @@ local function emit_chat_stream(obj)
         id = obj.id, object = "chat.completion.chunk", created = obj.created, model = obj.model,
         choices = { { index = 0, delta = { role = "assistant", content = "" }, logprobs = ngx.null, finish_reason = ngx.null } },
     }
-    if obj.prompt_token_ids ~= nil then first.prompt_token_ids = obj.prompt_token_ids end
-    if obj.prompt_text ~= nil then first.prompt_text = obj.prompt_text end
+    if not is_null(obj.prompt_token_ids) then first.prompt_token_ids = obj.prompt_token_ids end
+    if not is_null(obj.prompt_text) then first.prompt_text = obj.prompt_text end
     sse(cjson.encode(first))
 
     local calls = {}
@@ -253,8 +257,8 @@ local function emit_chat_stream(obj)
             local tc = msg.tool_calls[i]
             local fn = tc["function"]
             calls[#calls + 1] = {
-                id = (tc.id ~= nil and tc.id ~= ngx.null) and tc.id or nil,
-                name = fn and (fn.name ~= nil and fn.name ~= ngx.null) and fn.name or nil,
+                id = not is_null(tc.id) and tc.id or nil,
+                name = fn and not is_null(fn.name) and fn.name or nil,
                 arguments = fn and field_str(fn.arguments) or "",
             }
         end
@@ -291,12 +295,12 @@ local function emit_chat_stream(obj)
         choices = { { index = 0, delta = {}, logprobs = ngx.null, finish_reason = finish_reason, stop_reason = ngx.null, token_ids = ngx.null } },
     }))
 
-    if obj.usage ~= nil then
+    if not is_null(obj.usage) then
         local usage = {
             id = obj.id, object = "chat.completion.chunk", created = obj.created, model = obj.model,
             choices = cjson.empty_array, usage = obj.usage,
         }
-        if obj.system_fingerprint ~= nil then usage.system_fingerprint = obj.system_fingerprint end
+        if not is_null(obj.system_fingerprint) then usage.system_fingerprint = obj.system_fingerprint end
         sse(cjson.encode(usage))
     end
 
@@ -322,7 +326,7 @@ local function emit_text_stream(obj)
                 stop_reason = ngx.null, prompt_token_ids = ngx.null, token_ids = ngx.null,
             } },
         }
-        if last and obj.system_fingerprint ~= nil then chunk.system_fingerprint = obj.system_fingerprint end
+        if last and not is_null(obj.system_fingerprint) then chunk.system_fingerprint = obj.system_fingerprint end
         sse(cjson.encode(chunk))
     end
 
