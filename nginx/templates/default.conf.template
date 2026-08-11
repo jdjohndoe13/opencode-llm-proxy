@@ -29,8 +29,8 @@ server {
         proxy_set_header Accept-Encoding "";
         proxy_set_header Connection "";
         proxy_connect_timeout 10s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
     }
 
     # Everything else: transparent proxy to the same backend.
@@ -42,7 +42,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_connect_timeout 10s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
     }
 }
