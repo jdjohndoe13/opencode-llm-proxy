@@ -21,6 +21,13 @@ math.randomseed(math.floor(ngx.now() * 1000) + ngx.worker.pid())
 
 local _M = {}
 
+-- ngx.null is a truthy lightuserdata (tostring(ngx.null) == "userdata: NULL"),
+-- so treat it like nil when reading optional backend fields.
+local function field_str(v)
+    if v == nil or v == ngx.null then return "" end
+    return tostring(v)
+end
+
 local function is_prefix_char(c)
     return c == " " or c == "\t" or c == "\n" or c == "\r" or c == "|"
 end
@@ -238,16 +245,17 @@ local function emit_chat_stream(obj)
     sse(cjson.encode(first))
 
     local calls = {}
-    local reasoning = (msg and msg.reasoning and tostring(msg.reasoning)) or ""
-    local content = (msg and msg.content and tostring(msg.content)) or ""
+    local reasoning = msg and field_str(msg.reasoning) or ""
+    local content = msg and field_str(msg.content) or ""
 
     if msg and type(msg.tool_calls) == "table" then
         for i = 1, #msg.tool_calls do
             local tc = msg.tool_calls[i]
+            local fn = tc["function"]
             calls[#calls + 1] = {
-                id = tc.id or nil,
-                name = tc["function"] and tc["function"].name or nil,
-                arguments = tc["function"] and tc["function"].arguments or "",
+                id = (tc.id ~= nil and tc.id ~= ngx.null) and tc.id or nil,
+                name = fn and (fn.name ~= nil and fn.name ~= ngx.null) and fn.name or nil,
+                arguments = fn and field_str(fn.arguments) or "",
             }
         end
     end
