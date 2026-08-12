@@ -20,14 +20,17 @@ local HEX = "0123456789abcdef"
 -- GPU temperature monitor. The endpoint returns a JSON object mapping GPU
 -- names to temperatures, e.g. {"gpu_0":48,"gpu_1":49,...}. The proxy stalls
 -- (stops forwarding to the upstream) while any temperature is above
--- STALL_ABOVE and only resumes once every temperature is below RESUME_BELOW
--- (hysteresis so the machine has time to cool down).
+-- TEMP_CHECK_STALL_ABOVE and only resumes once every temperature is below
+-- TEMP_CHECK_RESUME_BELOW (hysteresis so the machine has time to cool down).
 --
 -- Every tuning value is injected from the environment into the nginx config
 -- as a `set $var` directive (see default.conf.template) and read back here
--- via ngx.var. There are deliberately no defaults: the container refuses to
--- start when a variable is missing, and the checks below fail loaded requests
--- if one ever slips through.
+-- via ngx.var. The whole monitor is armed only when TEMP_CHECK_ENABLED is
+-- "1" or "true" (case-insensitive); otherwise all TEMP_CHECK_* variables are
+-- ignored and the proxy behaves as if every check passed. When enabled there
+-- are deliberately no defaults: the container refuses to start when a
+-- variable is missing, and the checks below fail loaded requests if one ever
+-- slips through.
 
 local function require_var(name, v)
     if not v or v == "" then
@@ -56,13 +59,35 @@ local function parse_temp_endpoint(url)
     return host, port, path
 end
 
-local TEMP_ENDPOINT = require_var("temp_endpoint", ngx.var.temp_endpoint)
-local STALL_ABOVE = require_number("stall_above", ngx.var.stall_above)
-local RESUME_BELOW = require_number("resume_below", ngx.var.resume_below)
-local TEMP_POLL_INTERVAL = require_number("temp_poll_interval", ngx.var.temp_poll_interval)
-local TEMP_CACHE_TTL = require_number("temp_cache_ttl", ngx.var.temp_cache_ttl)
-local TEMP_HTTP_TIMEOUT = require_number("temp_http_timeout", ngx.var.temp_http_timeout)
-local STALL_LOG = require_var("stall_log", ngx.var.stall_log)
+-- Temperature checks are armed only when TEMP_CHECK_ENABLED is exactly "1"
+-- or "true" (case-insensitive). When disabled, every other TEMP_CHECK_*
+-- variable is ignored and the proxy behaves as if all checks passed.
+local TEMP_CHECKS_ENABLED = (tostring(ngx.var.temp_check_enabled or ""):lower() == "1")
+    or (tostring(ngx.var.temp_check_enabled or ""):lower() == "true")
+
+local TEMP_CHECK_ENDPOINT
+local TEMP_CHECK_STALL_ABOVE
+local TEMP_CHECK_RESUME_BELOW
+local TEMP_CHECK_POLL_INTERVAL
+local TEMP_CHECK_CACHE_TTL
+local TEMP_CHECK_HTTP_TIMEOUT
+local TEMP_CHECK_STALL_LOG
+local TEMP_CHECK_HOST, TEMP_CHECK_PORT, TEMP_CHECK_PATH
+
+if TEMP_CHECKS_ENABLED then
+    TEMP_CHECK_ENDPOINT = require_var("temp_check_endpoint", ngx.var.temp_check_endpoint)
+    TEMP_CHECK_STALL_ABOVE = require_number("temp_check_stall_above", ngx.var.temp_check_stall_above)
+    TEMP_CHECK_RESUME_BELOW = require_number("temp_check_resume_below", ngx.var.temp_check_resume_below)
+    TEMP_CHECK_POLL_INTERVAL = require_number("temp_check_poll_interval", ngx.var.temp_check_poll_interval)
+    TEMP_CHECK_CACHE_TTL = require_number("temp_check_cache_ttl", ngx.var.temp_check_cache_ttl)
+    TEMP_CHECK_HTTP_TIMEOUT = require_number("temp_check_http_timeout", ngx.var.temp_check_http_timeout)
+    TEMP_CHECK_STALL_LOG = require_var("temp_check_stall_log", ngx.var.temp_check_stall_log)
+
+    TEMP_CHECK_HOST, TEMP_CHECK_PORT, TEMP_CHECK_PATH = parse_temp_endpoint(TEMP_CHECK_ENDPOINT)
+    if not TEMP_CHECK_HOST then
+        error("invalid temp_check_endpoint URL, expected http://host:port/path: " .. tostring(TEMP_CHECK_ENDPOINT), 2)
+    end
+end
 
 -- Keep-alive heartbeat for streaming clients: fake empty SSE chunks start
 -- emitting KEEPALIVE_DELAY seconds after the request was fully received and
@@ -71,11 +96,6 @@ local STALL_LOG = require_var("stall_log", ngx.var.stall_log)
 -- latency don't abort the stream.
 local KEEPALIVE_DELAY = require_number("keepalive_delay", ngx.var.keepalive_delay)
 local KEEPALIVE_INTERVAL = require_number("keepalive_interval", ngx.var.keepalive_interval)
-
-local TEMP_HOST, TEMP_PORT, TEMP_PATH = parse_temp_endpoint(TEMP_ENDPOINT)
-if not TEMP_HOST then
-    error("invalid temp_endpoint URL, expected http://host:port/path: " .. tostring(TEMP_ENDPOINT), 2)
-end
 
 math.randomseed(math.floor(ngx.now() * 1000) + ngx.worker.pid())
 
@@ -523,14 +543,14 @@ end
 -- cosocket. Returns a list of numeric temperatures, or nil on any failure.
 local function fetch_temperatures()
     local sock = ngx.socket.tcp()
-    sock:settimeout(TEMP_HTTP_TIMEOUT)
-    local ok, err = sock:connect(TEMP_HOST, TEMP_PORT)
+    sock:settimeout(TEMP_CHECK_HTTP_TIMEOUT)
+    local ok, err = sock:connect(TEMP_CHECK_HOST, TEMP_CHECK_PORT)
     if not ok then
         ngx.log(ngx.ERR, "temperature endpoint connect failed: " .. tostring(err))
         return nil
     end
-    local req = "GET " .. TEMP_PATH .. " HTTP/1.1\r\n"
-        .. "Host: " .. TEMP_HOST .. ":" .. TEMP_PORT .. "\r\n"
+    local req = "GET " .. TEMP_CHECK_PATH .. " HTTP/1.1\r\n"
+        .. "Host: " .. TEMP_CHECK_HOST .. ":" .. TEMP_CHECK_PORT .. "\r\n"
         .. "Connection: close\r\n\r\n"
     local _, werr = sock:send(req)
     if werr then
@@ -624,17 +644,23 @@ local function read_temp_cache()
     local max = d:get("max_temp")
     local checked_at = d:get("checked_at")
     if not max or not checked_at then return nil, nil end
-    if ngx.now() - checked_at > TEMP_CACHE_TTL then return nil, nil end
+    if ngx.now() - checked_at > TEMP_CHECK_CACHE_TTL then return nil, nil end
     return max, checked_at
 end
 
--- Stalls the request until every GPU temperature is safely below RESUME_BELOW.
--- If any temperature is above STALL_ABOVE the request is not forwarded to the
--- upstream and we keep polling the monitor (at most once per second, shared
--- across all requests) until everything cools down. If the monitor cannot be
--- reached the proxy conservatively keeps stalling. Returns true when it is
--- safe to proceed, false if the client disconnected while waiting.
+-- Stalls the request until every GPU temperature is safely below
+-- TEMP_CHECK_RESUME_BELOW. If any temperature is above
+-- TEMP_CHECK_STALL_ABOVE the request is not forwarded to the upstream and we
+-- keep polling the monitor (at most once per second, shared across all
+-- requests) until everything cools down. If the monitor cannot be reached the
+-- proxy conservatively keeps stalling. Returns true when it is safe to
+-- proceed, false if the client disconnected while waiting. When temperature
+-- checks are disabled it always returns true immediately (as if every check
+-- passed).
 local function wait_for_cool_down(state)
+    if not TEMP_CHECKS_ENABLED then
+        return true
+    end
     local stalled = false
     while true do
         if state.aborted then return false end
@@ -653,14 +679,14 @@ local function wait_for_cool_down(state)
 
         if max then
             if stalled then
-                if max < RESUME_BELOW then
+                if max < TEMP_CHECK_RESUME_BELOW then
                     ngx.ctx._stall_end = ngx.now()
-                    ngx.log(ngx.NOTICE, "GPU cooled to " .. max .. " (<" .. RESUME_BELOW .. "), resuming request")
+                    ngx.log(ngx.NOTICE, "GPU cooled to " .. max .. " (<" .. TEMP_CHECK_RESUME_BELOW .. "), resuming request")
                     return true
                 end
-            elseif max > STALL_ABOVE then
+            elseif max > TEMP_CHECK_STALL_ABOVE then
                 if not ngx.ctx._stall_start then ngx.ctx._stall_start = ngx.now() end
-                ngx.log(ngx.NOTICE, "GPU temperature " .. max .. " > " .. STALL_ABOVE .. ", stalling request")
+                ngx.log(ngx.NOTICE, "GPU temperature " .. max .. " > " .. TEMP_CHECK_STALL_ABOVE .. ", stalling request")
                 stalled = true
             else
                 return true
@@ -669,7 +695,7 @@ local function wait_for_cool_down(state)
 
         -- Wait one poll interval, waking periodically to notice client aborts
         -- and to keep streaming clients fed with keep-alive chunks.
-        local deadline = ngx.now() + TEMP_POLL_INTERVAL
+        local deadline = ngx.now() + TEMP_CHECK_POLL_INTERVAL
         while ngx.now() < deadline do
             if state.aborted then return false end
             send_keepalive()
@@ -736,9 +762,10 @@ function _M.completions()
     -- window, non-200 results are relayed as plain HTTP errors; only once the
     -- handshake has gone out is a later failure sent as an SSE error event.
 
-    -- Cool-down guard: while any GPU temperature is above STALL_ABOVE, do not
-    -- forward the request to the upstream. Keep polling the monitor (about
-    -- once per second) until every temperature drops below RESUME_BELOW.
+    -- Cool-down guard: while any GPU temperature is above
+    -- TEMP_CHECK_STALL_ABOVE, do not forward the request to the upstream.
+    -- Keep polling the monitor (about once per second) until every
+    -- temperature drops below TEMP_CHECK_RESUME_BELOW.
     if not wait_for_cool_down(state) then
         ngx.log(ngx.INFO, "client aborted while stalling for cool-down")
         return ngx.exit(444)
@@ -937,11 +964,12 @@ function _M.completions()
 end
 
 -- Runs in the log phase (after the response has been fully sent) and writes
--- one JSON line per request to STALL_LOG, e.g:
+-- one JSON line per request to TEMP_CHECK_STALL_LOG, e.g:
 --   {"time":"...","ts":...,"uri":"/v1/completions","status":200,"aborted":false,"total_s":1.234,"stall_s":0.0}
 -- Tooling can sum total_s (time from incoming to last byte returned) and
 -- stall_s (time spent waiting for the GPUs to cool down) across all lines.
 function _M.log_request()
+    if not TEMP_CHECKS_ENABLED or not TEMP_CHECK_STALL_LOG then return end
     local c = ngx.ctx
     local ended = ngx.now()
     local start = c._start or ended
@@ -964,9 +992,9 @@ function _M.log_request()
         entry.stall_s = 0
     end
 
-    local f, err = io.open(STALL_LOG, "a")
+    local f, err = io.open(TEMP_CHECK_STALL_LOG, "a")
     if not f then
-        ngx.log(ngx.ERR, "failed to open stall log " .. STALL_LOG .. ": " .. tostring(err))
+        ngx.log(ngx.ERR, "failed to open stall log " .. TEMP_CHECK_STALL_LOG .. ": " .. tostring(err))
         return
     end
     f:write(cjson.encode(entry) .. "\n")

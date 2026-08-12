@@ -12,19 +12,20 @@ server {
     # Backend address used by the Lua cosocket handler.
     set $llm_backend ${LLM_BACKEND};
 
-    # GPU temperature monitor endpoint (full URL, substituted from
-    # TEMP_ENDPOINT at startup, read by the Lua handler via ngx.var).
-    set $temp_endpoint ${TEMP_ENDPOINT};
-
-    # GPU temperature monitor tuning. Every value is injected from the
-    # environment at startup (no defaults: the container refuses to start
-    # when a variable is missing).
-    set $stall_above ${STALL_ABOVE};
-    set $resume_below ${RESUME_BELOW};
-    set $temp_poll_interval ${TEMP_POLL_INTERVAL};
-    set $temp_cache_ttl ${TEMP_CACHE_TTL};
-    set $temp_http_timeout ${TEMP_HTTP_TIMEOUT};
-    set $stall_log ${STALL_LOG};
+    # GPU temperature monitor (cool-down guard). TEMP_CHECK_ENABLED ("1" or
+    # "true", case-insensitive) arms it; when unset or any other value the
+    # monitor is disabled, the TEMP_CHECK_* values below are ignored
+    # (substituted as empty strings at startup) and the proxy behaves as if
+    # every check passed. Endpoint is a full URL, read by the Lua handler
+    # via ngx.var.
+    set $temp_check_enabled ${TEMP_CHECK_ENABLED};
+    set $temp_check_endpoint ${TEMP_CHECK_ENDPOINT};
+    set $temp_check_stall_above ${TEMP_CHECK_STALL_ABOVE};
+    set $temp_check_resume_below ${TEMP_CHECK_RESUME_BELOW};
+    set $temp_check_poll_interval ${TEMP_CHECK_POLL_INTERVAL};
+    set $temp_check_cache_ttl ${TEMP_CHECK_CACHE_TTL};
+    set $temp_check_http_timeout ${TEMP_CHECK_HTTP_TIMEOUT};
+    set $temp_check_stall_log ${TEMP_CHECK_STALL_LOG};
 
     # Keep-alive heartbeat for streaming clients: fake empty SSE chunks start
     # KEEPALIVE_DELAY seconds after the request was received and repeat every

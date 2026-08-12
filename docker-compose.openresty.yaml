@@ -7,13 +7,18 @@ services:
       - "9999:9999"
     environment:
       LLM_BACKEND: host.docker.internal:21025
-      TEMP_ENDPOINT: "http://host.docker.internal:18082/temperatures"
-      STALL_ABOVE: "72"
-      RESUME_BELOW: "60"
-      TEMP_POLL_INTERVAL: "1.0"
-      TEMP_CACHE_TTL: "0.9"
-      TEMP_HTTP_TIMEOUT: "5000"
-      STALL_LOG: "/var/log/nginx/completions/stall.log"
+      # GPU temperature checks (cool-down guard). Disabled by default: when
+      # TEMP_CHECK_ENABLED is unset or anything other than "1" / "true"
+      # (case-insensitive) the checks are off and every other TEMP_CHECK_*
+      # variable below is ignored. Set it to "1" or "true" to enable.
+      TEMP_CHECK_ENABLED: "1"
+      TEMP_CHECK_ENDPOINT: "http://host.docker.internal:18082/temperatures"
+      TEMP_CHECK_STALL_ABOVE: "72"
+      TEMP_CHECK_RESUME_BELOW: "60"
+      TEMP_CHECK_POLL_INTERVAL: "1.0"
+      TEMP_CHECK_CACHE_TTL: "0.9"
+      TEMP_CHECK_HTTP_TIMEOUT: "5000"
+      TEMP_CHECK_STALL_LOG: "/var/log/nginx/completions/stall.log"
       # Keep-alive heartbeat for streaming clients: fake empty SSE chunks (and
       # the SSE handshake) start only KEEPALIVE_DELAY seconds after the request
       # was received, then repeat every KEEPALIVE_INTERVAL seconds until the
@@ -31,26 +36,45 @@ services:
       - -c
       - |
         : "$${LLM_BACKEND:?LLM_BACKEND must be set}"
-        : "$${TEMP_ENDPOINT:?TEMP_ENDPOINT must be set}"
-        : "$${STALL_ABOVE:?STALL_ABOVE must be set}"
-        : "$${RESUME_BELOW:?RESUME_BELOW must be set}"
-        : "$${TEMP_POLL_INTERVAL:?TEMP_POLL_INTERVAL must be set}"
-        : "$${TEMP_CACHE_TTL:?TEMP_CACHE_TTL must be set}"
-        : "$${TEMP_HTTP_TIMEOUT:?TEMP_HTTP_TIMEOUT must be set}"
-        : "$${STALL_LOG:?STALL_LOG must be set}"
         : "$${KEEPALIVE_DELAY:?KEEPALIVE_DELAY must be set}"
         : "$${KEEPALIVE_INTERVAL:?KEEPALIVE_INTERVAL must be set}"
+
+        # Temperature checks: only "1" or "true" (case-insensitive) enables
+        # them. Any other value (or an unset TEMP_CHECK_ENABLED) disables the
+        # checks; the remaining TEMP_CHECK_* variables are then ignored and
+        # the proxy behaves as if every check passed.
+        tc_enabled=0
+        case "$${TEMP_CHECK_ENABLED}" in
+            1|[Tt][Rr][Uu][Ee]) tc_enabled=1 ;;
+        esac
+        if [ "$$tc_enabled" = "1" ]; then
+            : "$${TEMP_CHECK_ENDPOINT:?TEMP_CHECK_ENDPOINT must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_STALL_ABOVE:?TEMP_CHECK_STALL_ABOVE must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_RESUME_BELOW:?TEMP_CHECK_RESUME_BELOW must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_POLL_INTERVAL:?TEMP_CHECK_POLL_INTERVAL must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_CACHE_TTL:?TEMP_CHECK_CACHE_TTL must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_HTTP_TIMEOUT:?TEMP_CHECK_HTTP_TIMEOUT must be set when temperature checks are enabled}"
+            : "$${TEMP_CHECK_STALL_LOG:?TEMP_CHECK_STALL_LOG must be set when temperature checks are enabled}"
+            echo "Temperature checks are ENABLED (TEMP_CHECK_ENABLED=$${TEMP_CHECK_ENABLED})."
+        else
+            echo "Temperature checks are DISABLED. Set TEMP_CHECK_ENABLED=1 or true to enable them."
+        fi
+
         mkdir -p /var/log/nginx/completions /etc/nginx/conf.d &&
         chown nobody:nobody /var/log/nginx/completions &&
         escp() { printf '%s' "$1" | sed 's/[\\/&]/\\&/g'; } &&
+        # tc() returns the escaped value when checks are enabled, otherwise a
+        # valid empty nginx string so the set directives never go blank.
+        tc() { if [ "$$tc_enabled" = "1" ]; then escp "$1"; else printf '""'; fi; } &&
         sed -e 's/\$${LLM_BACKEND}/'"$$(escp "$$LLM_BACKEND")"'/g' \
-            -e 's/\$${TEMP_ENDPOINT}/'"$$(escp "$$TEMP_ENDPOINT")"'/g' \
-            -e 's/\$${STALL_ABOVE}/'"$$(escp "$$STALL_ABOVE")"'/g' \
-            -e 's/\$${RESUME_BELOW}/'"$$(escp "$$RESUME_BELOW")"'/g' \
-            -e 's/\$${TEMP_POLL_INTERVAL}/'"$$(escp "$$TEMP_POLL_INTERVAL")"'/g' \
-            -e 's/\$${TEMP_CACHE_TTL}/'"$$(escp "$$TEMP_CACHE_TTL")"'/g' \
-            -e 's/\$${TEMP_HTTP_TIMEOUT}/'"$$(escp "$$TEMP_HTTP_TIMEOUT")"'/g' \
-            -e 's/\$${STALL_LOG}/'"$$(escp "$$STALL_LOG")"'/g' \
+            -e 's/\$${TEMP_CHECK_ENABLED}/'"$$(escp "$${TEMP_CHECK_ENABLED:-0}")"'/g' \
+            -e 's/\$${TEMP_CHECK_ENDPOINT}/'"$$(tc "$$TEMP_CHECK_ENDPOINT")"'/g' \
+            -e 's/\$${TEMP_CHECK_STALL_ABOVE}/'"$$(tc "$$TEMP_CHECK_STALL_ABOVE")"'/g' \
+            -e 's/\$${TEMP_CHECK_RESUME_BELOW}/'"$$(tc "$$TEMP_CHECK_RESUME_BELOW")"'/g' \
+            -e 's/\$${TEMP_CHECK_POLL_INTERVAL}/'"$$(tc "$$TEMP_CHECK_POLL_INTERVAL")"'/g' \
+            -e 's/\$${TEMP_CHECK_CACHE_TTL}/'"$$(tc "$$TEMP_CHECK_CACHE_TTL")"'/g' \
+            -e 's/\$${TEMP_CHECK_HTTP_TIMEOUT}/'"$$(tc "$$TEMP_CHECK_HTTP_TIMEOUT")"'/g' \
+            -e 's/\$${TEMP_CHECK_STALL_LOG}/'"$$(tc "$$TEMP_CHECK_STALL_LOG")"'/g' \
             -e 's/\$${KEEPALIVE_DELAY}/'"$$(escp "$$KEEPALIVE_DELAY")"'/g' \
             -e 's/\$${KEEPALIVE_INTERVAL}/'"$$(escp "$$KEEPALIVE_INTERVAL")"'/g' \
             /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf &&
