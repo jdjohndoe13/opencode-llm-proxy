@@ -225,26 +225,48 @@ local function strip_tool_calls(text)
     return t:gsub("%s+$", ""), calls
 end
 
--- Partitions a string into substrings of at most max_len characters, breaking
--- on word boundaries when possible. Concatenating the parts reproduces the
--- input exactly.
+-- Byte length of the UTF-8 sequence starting at byte position i of s
+-- (1 for ASCII, 2/3/4 for multi-byte sequences). Never returns more bytes
+-- than remain in the string.
+local function char_byte_len(s, i)
+    local b = s:byte(i)
+    if not b then return 0 end
+    if b < 0x80 then return 1 end
+    if b >= 0xF0 then return math.min(4, #s - i + 1) end
+    if b >= 0xE0 then return math.min(3, #s - i + 1) end
+    if b >= 0xC0 then return math.min(2, #s - i + 1) end
+    return 1
+end
+
+-- Partitions a UTF-8 string into substrings of at most max_len code points,
+-- breaking on word boundaries (ASCII spaces) when possible. The cut always
+-- falls on a character boundary, so multi-byte characters (Cyrillic,
+-- box-drawing, emoji, ...) are never split in half and every chunk is valid
+-- UTF-8 on its own. Concatenating the parts reproduces the input exactly.
 local function split_text(s, max_len)
     local parts = {}
-    local rest = s
-    while #rest > max_len do
-        local nchars
-        local start = 1
-        while true do
-            local sp = rest:find(" ", start, true)
-            if not sp or sp > max_len then break end
-            nchars = sp - 1
-            start = sp + 1
+    local n = #s
+    local pos = 1
+    while pos <= n do
+        -- Scan up to max_len code points from pos, remembering the last
+        -- word boundary (byte position just before a space) seen so far.
+        local cut
+        local count = 0
+        local i = pos
+        while i <= n and count < max_len do
+            if s:sub(i, i) == " " then cut = i - 1 end
+            i = i + char_byte_len(s, i)
+            count = count + 1
         end
-        if not nchars or nchars < 1 then nchars = max_len end
-        parts[#parts + 1] = rest:sub(1, nchars)
-        rest = rest:sub(nchars + 1)
+        local endpos
+        if cut and cut >= pos then
+            endpos = cut
+        else
+            endpos = i - 1
+        end
+        parts[#parts + 1] = s:sub(pos, endpos)
+        pos = endpos + 1
     end
-    if #rest > 0 then parts[#parts + 1] = rest end
     return parts
 end
 
