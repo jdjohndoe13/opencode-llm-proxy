@@ -13,6 +13,7 @@ local cjson = require "cjson"
 local socket = ngx.socket
 
 local LOG_DIR = "/var/log/nginx/completions"
+local STATS_LOG = LOG_DIR .. "/stats.jsonl"
 local CHUNK_SIZE = 16
 local POLL_MS = 1000
 local HEX = "0123456789abcdef"
@@ -110,6 +111,13 @@ end
 local function field_str(v)
     if is_null(v) then return "" end
     return tostring(v)
+end
+
+-- Token count for the stats log: any missing or invalid value becomes 0
+-- (e.g. error responses carry no usage object, so nothing can be deduced).
+local function stat_num(v)
+    if type(v) == "number" then return math.floor(v + 0.5) end
+    return 0
 end
 
 local function is_prefix_char(c)
@@ -761,6 +769,7 @@ function _M.completions()
     ngx.ctx._keepalive_id = (type(obj.id) == "string" and obj.id ~= "") and obj.id or "chatcmpl-keepalive"
     ngx.ctx._keepalive_model = type(obj.model) == "string" and obj.model or "unknown"
     ngx.ctx._keepalive_created = math.floor(ngx.now())
+    ngx.ctx._req_model = type(obj.model) == "string" and obj.model or nil
 
     -- Register the abort handler before the cool-down stall so a client
     -- disconnect during the stall (or while waiting for the upstream) is
@@ -792,6 +801,11 @@ function _M.completions()
         ngx.log(ngx.INFO, "client aborted while stalling for cool-down")
         return ngx.exit(444)
     end
+
+    -- From this point on the request is actually forwarded to the proxied
+    -- server: this is the "sent to the backend" moment recorded in the stats
+    -- log (the cool-down stall above is deliberately excluded from it).
+    ngx.ctx._sent_at = ngx.now()
 
     local path = ngx.var.uri
     local args = ngx.var.args
@@ -869,6 +883,7 @@ function _M.completions()
     end
 
     local status = tonumber(status_line:match("^HTTP/%d+%.?%d*%s+(%d+)")) or 500
+    ngx.ctx._upstream_status = status
     local headers = {}
     local content_length = nil
     local chunked = false
@@ -907,6 +922,7 @@ function _M.completions()
 
     sock:close()
     state.sock = nil
+    ngx.ctx._upstream_done = ngx.now() -- upstream exchange finished (body read or read failure)
 
     if not body then
         ngx.log(ngx.ERR, "failed to read response body from " .. backend .. ": " .. tostring(err))
@@ -919,6 +935,19 @@ function _M.completions()
     end
 
     dump(ts, "resp", body)
+
+    -- Parse the upstream JSON once: usage/model are stashed for the stats
+    -- log (zeros when they cannot be deduced, e.g. a non-200 response), and
+    -- the decoded object is reused below for the SSE emission.
+    local jobj
+    if status == 200 and body ~= "" then
+        local okj, decoded = pcall(cjson.decode, body)
+        if okj and type(decoded) == "table" then
+            jobj = decoded
+            ngx.ctx._resp_usage = decoded.usage
+            ngx.ctx._resp_model = decoded.model
+        end
+    end
 
     if want_stream and ngx.ctx._sse_started then
         -- The SSE handshake was already sent (the upstream took longer than
@@ -964,8 +993,9 @@ function _M.completions()
         end
     end
 
-    local okj, jobj = pcall(cjson.decode, body)
-    if not okj or type(jobj) ~= "table" then
+    -- The body was already decoded above (for the stats usage); reaching this
+    -- point with no object means the JSON was unparsable.
+    if not jobj then
         sse(body)
         sse("[DONE]")
         return ngx.exit(ngx.HTTP_OK)
@@ -985,16 +1015,63 @@ function _M.completions()
     return ngx.exit(ngx.HTTP_OK)
 end
 
--- Runs in the log phase (after the response has been fully sent) and writes
--- one JSON line per request to TEMP_CHECK_STALL_LOG, e.g:
+-- Runs in the log phase (after the response has been fully sent).
+--
+-- stats.jsonl: one JSON line per request that was actually forwarded to the
+-- upstream (i.e. past the cool-down stall; requests rejected earlier —
+-- invalid bodies, client aborts during the stall — are not recorded here).
+-- start_time_unix / start_time / duration_ms refer to the upstream send:
+-- start is the moment the request was sent to the proxied server (after the
+-- GPU cool-down wait), duration runs until the response was fully received
+-- from it (or until the log phase, if the exchange was cut short). Token
+-- counts come from the upstream response usage and are 0 when they cannot be
+-- deduced (e.g. a 404), status is the upstream HTTP status (or the status
+-- this request ended with when the upstream never answered).
+--
+-- Then writes the existing stall.log line:
 --   {"time":"...","ts":...,"uri":"/v1/completions","status":200,"aborted":false,"total_s":1.234,"stall_s":0.0}
 -- Tooling can sum total_s (time from incoming to last byte returned) and
 -- stall_s (time spent waiting for the GPUs to cool down) across all lines.
 function _M.log_request()
-    if not TEMP_CHECKS_ENABLED or not TEMP_CHECK_STALL_LOG then return end
     local c = ngx.ctx
     local ended = ngx.now()
     local start = c._start or ended
+
+    local stall_s = 0
+    if c._stall_start then
+        stall_s = math.floor(((c._stall_end or ended) - c._stall_start) * 1000 + 0.5) / 1000
+    end
+
+    if c._sent_at then
+        local sent_at = c._sent_at
+        local usage = c._resp_usage
+        if is_null(usage) or type(usage) ~= "table" then usage = {} end
+        local model = c._resp_model
+        if is_null(model) or model == "" then model = c._req_model end
+        if is_null(model) or model == "" then model = "unknown" end
+
+        local entry = {
+            model = model,
+            prompt_tokens = stat_num(usage.prompt_tokens),
+            total_tokens = stat_num(usage.total_tokens),
+            completion_tokens = stat_num(usage.completion_tokens),
+            status = c._upstream_status or ngx.status,
+            stall_seconds = stall_s,
+            start_time_unix = math.floor(sent_at * 1000 + 0.5),
+            start_time = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(sent_at + 0.5)),
+            duration_ms = math.floor(((c._upstream_done or ended) - sent_at) * 1000 + 0.5),
+        }
+
+        local f, err = io.open(STATS_LOG, "a")
+        if not f then
+            ngx.log(ngx.ERR, "failed to open stats log " .. STATS_LOG .. ": " .. tostring(err))
+        else
+            f:write(cjson.encode(entry) .. "\n")
+            f:close()
+        end
+    end
+
+    if not TEMP_CHECKS_ENABLED or not TEMP_CHECK_STALL_LOG then return end
 
     local entry = {
         time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
@@ -1003,15 +1080,12 @@ function _M.log_request()
         status = ngx.status,
         aborted = c._aborted == true,
         total_s = math.floor((ended - start) * 1000 + 0.5) / 1000,
+        stall_s = stall_s,
     }
 
     if c._stall_start then
-        local stall_end = c._stall_end or ended
         entry.stall_start = c._stall_start
-        entry.stall_end = stall_end
-        entry.stall_s = math.floor((stall_end - c._stall_start) * 1000 + 0.5) / 1000
-    else
-        entry.stall_s = 0
+        entry.stall_end = c._stall_end or ended
     end
 
     local f, err = io.open(TEMP_CHECK_STALL_LOG, "a")
