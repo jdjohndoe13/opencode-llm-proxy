@@ -6,26 +6,28 @@ services:
     ports:
       - "9999:9999"
     environment:
-      LLM_BACKEND: host.docker.internal:21025
+      # Values come from .env in this directory (docker compose loads it
+      # automatically; see .env.example for the variable reference).
+      LLM_BACKEND: ${LLM_BACKEND:?LLM_BACKEND must be set (copy .env.example to .env)}
       # GPU temperature checks (cool-down guard). Disabled by default: when
       # TEMP_CHECK_ENABLED is unset or anything other than "1" / "true"
       # (case-insensitive) the checks are off and every other TEMP_CHECK_*
       # variable below is ignored. Set it to "1" or "true" to enable.
-      TEMP_CHECK_ENABLED: "0"
-      TEMP_CHECK_ENDPOINT: "http://host.docker.internal:18082/temperatures"
-      TEMP_CHECK_STALL_ABOVE: "74"
-      TEMP_CHECK_RESUME_BELOW: "60"
-      TEMP_CHECK_POLL_INTERVAL: "1.0"
-      TEMP_CHECK_CACHE_TTL: "0.9"
-      TEMP_CHECK_HTTP_TIMEOUT: "5000"
-      TEMP_CHECK_STALL_LOG: "/var/log/nginx/completions/stall.log"
+      TEMP_CHECK_ENABLED: ${TEMP_CHECK_ENABLED:-0}
+      TEMP_CHECK_ENDPOINT: ${TEMP_CHECK_ENDPOINT:-}
+      TEMP_CHECK_STALL_ABOVE: ${TEMP_CHECK_STALL_ABOVE:-}
+      TEMP_CHECK_RESUME_BELOW: ${TEMP_CHECK_RESUME_BELOW:-}
+      TEMP_CHECK_POLL_INTERVAL: ${TEMP_CHECK_POLL_INTERVAL:-}
+      TEMP_CHECK_CACHE_TTL: ${TEMP_CHECK_CACHE_TTL:-}
+      TEMP_CHECK_HTTP_TIMEOUT: ${TEMP_CHECK_HTTP_TIMEOUT:-}
+      TEMP_CHECK_STALL_LOG: ${TEMP_CHECK_STALL_LOG:-}
       # Keep-alive heartbeat for streaming clients: fake empty SSE chunks (and
       # the SSE handshake) start only KEEPALIVE_DELAY seconds after the request
       # was received, then repeat every KEEPALIVE_INTERVAL seconds until the
       # upstream response arrives. The delay gives fast upstream errors a
       # window to come back as plain HTTP errors before the stream commits.
-      KEEPALIVE_DELAY: "30"
-      KEEPALIVE_INTERVAL: "5"
+      KEEPALIVE_DELAY: ${KEEPALIVE_DELAY:?KEEPALIVE_DELAY must be set (copy .env.example to .env)}
+      KEEPALIVE_INTERVAL: ${KEEPALIVE_INTERVAL:?KEEPALIVE_INTERVAL must be set (copy .env.example to .env)}
     volumes:
       - ./nginx/lua/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./nginx/lua/default.conf.template:/etc/nginx/templates/default.conf.template:ro

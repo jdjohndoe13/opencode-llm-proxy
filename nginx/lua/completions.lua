@@ -35,7 +35,7 @@ local HEX = "0123456789abcdef"
 
 local function require_var(name, v)
     if not v or v == "" then
-        error("missing configuration variable " .. name .. " (set it in docker-compose.openresty.yaml)", 2)
+        error("missing configuration variable " .. name .. " (set it in .env)", 2)
     end
     return v
 end

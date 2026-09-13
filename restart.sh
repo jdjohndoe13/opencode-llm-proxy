@@ -1,11 +1,6 @@
-# Full restart of the LLM proxy (OpenResty/Lua rewrite + SSE proxy on :9999).
-# Removes all proxy containers, including the legacy njs-based 'llm-proxy'
-# (an orphan of the same compose project), then recreates the OpenResty
-# container from scratch (fresh config + fresh container).
-#
-# Old njs-based setup (kept for reference):
+#!/bin/sh
+# Full restart of the LLM proxy: removes all containers of this compose
+# project (including orphans) and recreates the OpenResty container from
+# scratch (fresh config + fresh container). Values are read from .env.
 docker compose down -v --remove-orphans
 docker compose up -d --force-recreate
-
-#docker compose -f docker-compose.openresty.yaml down -v --remove-orphans
-#docker compose -f docker-compose.openresty.yaml up -d
