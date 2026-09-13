@@ -1,2 +1,1 @@
-logs/*.json
-logs/stall.log
+/logs

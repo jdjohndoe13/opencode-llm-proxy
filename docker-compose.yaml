@@ -11,9 +11,9 @@ services:
       # TEMP_CHECK_ENABLED is unset or anything other than "1" / "true"
       # (case-insensitive) the checks are off and every other TEMP_CHECK_*
       # variable below is ignored. Set it to "1" or "true" to enable.
-      TEMP_CHECK_ENABLED: "1"
+      TEMP_CHECK_ENABLED: "0"
       TEMP_CHECK_ENDPOINT: "http://host.docker.internal:18082/temperatures"
-      TEMP_CHECK_STALL_ABOVE: "72"
+      TEMP_CHECK_STALL_ABOVE: "74"
       TEMP_CHECK_RESUME_BELOW: "60"
       TEMP_CHECK_POLL_INTERVAL: "1.0"
       TEMP_CHECK_CACHE_TTL: "0.9"

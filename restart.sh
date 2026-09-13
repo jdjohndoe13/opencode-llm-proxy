@@ -4,8 +4,8 @@
 # container from scratch (fresh config + fresh container).
 #
 # Old njs-based setup (kept for reference):
-# docker compose down -v
-# docker compose up -d --force-recreate
+docker compose down -v --remove-orphans
+docker compose up -d --force-recreate
 
-docker compose -f docker-compose.openresty.yaml down -v --remove-orphans
-docker compose -f docker-compose.openresty.yaml up -d
+#docker compose -f docker-compose.openresty.yaml down -v --remove-orphans
+#docker compose -f docker-compose.openresty.yaml up -d
