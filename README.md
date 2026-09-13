@@ -25,6 +25,29 @@ into per-token `text` events, and the stream is terminated with
 `data: [DONE]`. Clients that ask for `stream: false` still get the plain
 JSON response. All other paths are proxied unchanged.
 
+## Why: OpenCode compatibility
+
+This proxy exists to make local vLLM backends usable with
+[OpenCode](https://github.com/anomalyco/opencode), which hardcodes
+`stream: true` for OpenAI-compatible providers (see
+[anomalyco/opencode#785](https://github.com/anomalyco/opencode/issues/785)).
+Some vLLM versions corrupt tool-call arguments in streaming mode, while the
+same request answered with `stream: false` returns clean output — and the
+workaround discussed in that issue is exactly what this proxy automates:
+force `stream: false` upstream and re-serialize the non-streaming response
+as an SSE stream for the client.
+
+OpenCode additionally aborts a streaming request when its first chunk does
+not arrive within its first-chunk timeout, and a local backend can easily
+stay silent longer than that while generating. The proxy bridges the gap
+with the keep-alive mechanism described in [How it works](#how-it-works):
+the SSE handshake is deferred for `KEEPALIVE_DELAY` seconds (default 30);
+if the upstream response has not fully arrived by then, the proxy commits
+to the stream — it sends `200 OK` with `text/event-stream` and then an
+empty heartbeat chunk every `KEEPALIVE_INTERVAL` seconds (default 5) until
+the real response is ready. Upstream answers (errors included) that arrive
+within the delay window are still relayed as plain HTTP responses.
+
 ## Files
 
 ```
