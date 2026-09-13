@@ -243,3 +243,7 @@ aborted.
 - The `Host` header sent to the backend is the `LLM_BACKEND` address (not
   the original client `Host`), which is fine for LLM backends that don't
   use virtual hosting.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
