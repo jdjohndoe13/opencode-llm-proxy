@@ -12,6 +12,10 @@ server {
     # Backend address used by the Lua cosocket handler.
     set $llm_backend ${LLM_BACKEND};
 
+    # top_p forced onto rewritten request bodies; a negative value (the
+    # default) leaves the client's top_p untouched.
+    set $top_p ${TOP_P};
+
     # GPU temperature monitor (cool-down guard). TEMP_CHECK_ENABLED ("1" or
     # "true", case-insensitive) arms it; when unset or any other value the
     # monitor is disabled, the TEMP_CHECK_* values below are ignored
@@ -35,7 +39,8 @@ server {
     set $keepalive_interval ${KEEPALIVE_INTERVAL};
 
     # /v1/completions and /v1/chat/completions: rewrite the JSON request body
-    # (top_p=0.95, stream=false) and forward it to the backend, converting the
+    # (stream=false, top_p forced to TOP_P when non-negative) and forward it
+    # to the backend, converting the
     # non-streaming response into SSE when the client requested streaming. The
     # upstream connection is closed as soon as the client disconnects.
     location ~ ^/v1/(chat/)?completions$ {

@@ -8,9 +8,11 @@ port **9999** and forwards everything to the backend configured via the
 For every request to **`/v1/completions`** or **`/v1/chat/completions`**
 (a JSON object body), the proxy rewrites the request body by setting:
 
-- `top_p` → `0.95`
 - `stream` → `false`
 - `stream_options` → removed
+- `top_p` → forced to the `TOP_P` value, but only when `TOP_P` is
+  non-negative (the shipped default `-1` leaves the client's `top_p`
+  untouched)
 
 and then passes the modified body to the backend at the same path. The
 backend therefore always responds with a single non-streaming JSON body.
@@ -57,6 +59,7 @@ cp .env.example .env
 | Variable | Meaning |
 | --- | --- |
 | `LLM_BACKEND` | Backend `host:port` (e.g. `host.docker.internal:21025`); used as the upstream address and as the `Host` header sent upstream |
+| `TOP_P` | `top_p` forced onto rewritten request bodies; a negative value (default `-1`) leaves the client's `top_p` untouched |
 | `TEMP_CHECK_ENABLED` | `1` or `true` (case-insensitive) arms the GPU temperature guard; anything else (or unset) disables it and every other `TEMP_CHECK_*` variable is ignored |
 | `TEMP_CHECK_ENDPOINT` | Full URL of a monitor returning a JSON object of GPU temperatures, e.g. `http://host.docker.internal:18082/temperatures` → `{"gpu_0":48,...}` |
 | `TEMP_CHECK_STALL_ABOVE` | Requests are stalled while any GPU temperature is above this value |
@@ -99,8 +102,9 @@ curl http://localhost:9999/v1/completions \
   -d '{"model":"gpt-3.5","prompt":"Hello","top_p":0.3,"stream":true}'
 ```
 
-The backend receives the body with `top_p: 0.95` and `stream: false` and
-responds non-streaming. When the client sent `stream: true`, the response is
+The backend receives the body with `stream: false` (and `top_p` forced to
+the `TOP_P` value when `TOP_P` is non-negative) and responds non-streaming.
+When the client sent `stream: true`, the response is
 returned as an SSE stream of `chat.completion.chunk` / `text_completion`
 events (one `data:` line per delta), terminated by `data: [DONE]`.
 
@@ -144,8 +148,9 @@ the foreground.
    every other path is proxied transparently to `http://${LLM_BACKEND}` with
    one-hour connect/send/read timeouts and `X-Forwarded-*` headers.
 4. The handler reads the request body (`ngx.req.read_body`), parses it as
-   JSON, forces `top_p: 0.95` / `stream: false`, drops `stream_options`, and
-   re-serializes it. The original (unmodified) body is dumped to
+   JSON, forces `stream: false`, drops `stream_options`, forces `top_p` to
+   the `TOP_P` value when `TOP_P` is non-negative, and re-serializes it.
+   The original (unmodified) body is dumped to
    `logs/<unix-ms>.req.json`.
 5. A client-disconnect handler is registered via `ngx.on_abort` (armed by
    `lua_check_client_abort on`) before the backend call: if the client
@@ -225,7 +230,8 @@ aborted.
   response is buffered in full by the Lua handler before being sent to the
   client, so SSE/streaming from the upstream is not supported on the
   rewritten endpoints.
-- `top_p` is always forced to `0.95` — clients cannot override it.
+- `stream` is always forced to `false`. `top_p` can be forced to a fixed
+  value via `TOP_P`; with the default `-1` clients control `top_p`.
 - The SSE stream returned to streaming clients is a token-split
   approximation of the upstream format: there is no realtime
   token-by-token timing while the response is being generated (empty

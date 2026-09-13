@@ -1,7 +1,8 @@
 -- OpenResty (ngx_lua) reimplementation of njs/completions.js.
 --
 -- Rewrites /v1/completions and /v1/chat/completions request bodies
--- (top_p=0.95, stream=false, stream_options removed), forwards the modified
+-- (stream=false, stream_options removed, and top_p forced to TOP_P when
+-- TOP_P is non-negative), forwards the modified
 -- body to the backend over a cosocket, and converts the always non-streaming
 -- backend response into an SSE stream when the client asked for stream=true.
 --
@@ -97,6 +98,11 @@ end
 -- latency don't abort the stream.
 local KEEPALIVE_DELAY = require_number("keepalive_delay", ngx.var.keepalive_delay)
 local KEEPALIVE_INTERVAL = require_number("keepalive_interval", ngx.var.keepalive_interval)
+
+-- top_p forced onto rewritten request bodies. A negative value (or an
+-- unset/invalid TOP_P) leaves the client's top_p untouched.
+local TOP_P = tonumber(ngx.var.top_p or "")
+if not TOP_P then TOP_P = -1 end
 
 math.randomseed(math.floor(ngx.now() * 1000) + ngx.worker.pid())
 
@@ -758,7 +764,7 @@ function _M.completions()
     end
 
     local want_stream = obj.stream == true
-    obj.top_p = 0.95
+    if TOP_P >= 0 then obj.top_p = TOP_P end
     obj.stream = false
     obj.stream_options = nil
     local new_body = cjson.encode(obj)
