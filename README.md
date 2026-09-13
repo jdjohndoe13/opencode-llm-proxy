@@ -37,16 +37,25 @@ workaround discussed in that issue is exactly what this proxy automates:
 force `stream: false` upstream and re-serialize the non-streaming response
 as an SSE stream for the client.
 
-OpenCode additionally aborts a streaming request when its first chunk does
-not arrive within its first-chunk timeout, and a local backend can easily
-stay silent longer than that while generating. The proxy bridges the gap
-with the keep-alive mechanism described in [How it works](#how-it-works):
-the SSE handshake is deferred for `KEEPALIVE_DELAY` seconds (default 30);
-if the upstream response has not fully arrived by then, the proxy commits
-to the stream — it sends `200 OK` with `text/event-stream` and then an
-empty heartbeat chunk every `KEEPALIVE_INTERVAL` seconds (default 5) until
-the real response is ready. Upstream answers (errors included) that arrive
-within the delay window are still relayed as plain HTTP responses.
+OpenCode additionally enforces timeouts on every provider request
+(`packages/opencode/src/provider/provider.ts`): the response **headers**
+must arrive within `headerTimeout` (default 300000 ms, i.e. 5 minutes;
+`false` disables it in `opencode.jsonc`), and for `text/event-stream`
+responses the gap between chunks must stay within `chunkTimeout` (default
+300000 ms; `false` disables). There is also an overall `timeout` (default
+300000 ms, `false` to disable) applied to the whole request — including
+the streamed body, so for backends that generate for minutes on end it
+should be raised or disabled. A local backend can easily stay silent
+longer than these windows allow, and OpenCode then fails the request with
+a timeout error. The proxy bridges the gap with the keep-alive mechanism
+described in [How it works](#how-it-works): the SSE handshake is deferred
+for `KEEPALIVE_DELAY` seconds (default 30); if the upstream response has
+not fully arrived by then, the proxy commits to the stream — it sends
+`200 OK` with `text/event-stream` (which satisfies `headerTimeout`) and
+then an empty heartbeat chunk every `KEEPALIVE_INTERVAL` seconds (default
+5, far below any `chunkTimeout`) until the real response is ready.
+Upstream answers (errors included) that arrive within the delay window
+are still relayed as plain HTTP responses.
 
 ## Files
 
