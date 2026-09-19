@@ -37,6 +37,8 @@ server {
     # clients with first-byte timeouts don't abort the stream.
     set $keepalive_delay ${KEEPALIVE_DELAY};
     set $keepalive_interval ${KEEPALIVE_INTERVAL};
+    set $tool_name_guard ${TOOL_NAME_GUARD};
+    set $tool_name_retry ${TOOL_NAME_RETRY};
 
     # /v1/completions and /v1/chat/completions: rewrite the JSON request body
     # (stream=false, top_p forced to TOP_P when non-negative) and forward it

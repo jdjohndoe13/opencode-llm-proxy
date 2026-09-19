@@ -99,6 +99,36 @@ end
 local KEEPALIVE_DELAY = require_number("keepalive_delay", ngx.var.keepalive_delay)
 local KEEPALIVE_INTERVAL = require_number("keepalive_interval", ngx.var.keepalive_interval)
 
+-- Tool-name guard for tool calls converted from response markup (see
+-- guard_tool_calls). Request tools are taken from the request body's
+-- "tools[].function.name" list.
+--   "remap" (default): unknown names are first repaired to the closest real
+--     tool (unique <=2 levenshtein, or unique same-server token match), the
+--     rest are dropped with a corrective note in the content;
+--   "strip": unknown names are always dropped with the note;
+--   "off": converted calls are emitted unvalidated (legacy behavior).
+local function normalize_guard(v)
+    v = tostring(v or ""):lower()
+    if v == "off" or v == "strip" or v == "remap" then return v end
+    return "remap"
+end
+local TOOL_NAME_GUARD = normalize_guard(ngx.var.tool_name_guard)
+
+-- Silent one-shot resend switch: when the guard would strip a hallucinated
+-- call from a streamed response, the identical request is resent once (fresh
+-- sample; nothing payload-bearing reached the client yet) and the retry is
+-- adopted when it comes back as a clean chat completion. Disabled by
+-- TOOL_NAME_RETRY=0/false/off/no; enabled when unset or any other value.
+local function normalize_bool(v)
+    if v == nil then return true end
+    v = string.lower(tostring(v))
+    return not (v == "0" or v == "false" or v == "off" or v == "no")
+end
+
+local TOOL_NAME_RETRY = normalize_bool(ngx.var.tool_name_retry)
+local TOOLNAME_LOG = LOG_DIR .. "/toolname_fixes.jsonl"
+local TOOLNAME_NOTE = "[tool-name-fixer]"
+
 -- top_p forced onto rewritten request bodies. A negative value (or an
 -- unset/invalid TOP_P) leaves the client's top_p untouched.
 local TOP_P = tonumber(ngx.var.top_p or "")
@@ -292,6 +322,194 @@ local function random_hex(len)
     return table.concat(t)
 end
 
+-- Bounded Levenshtein distance (iterative single-row DP, case-sensitive at
+-- byte level - callers lowercase the inputs). Strings longer than 64 bytes
+-- are compared over their 64-byte tail, which is enough for tool names.
+local function levenshtein(a, b)
+    if #a > 64 then a = a:sub(-64) end
+    if #b > 64 then b = b:sub(-64) end
+    local m, n = #a, #b
+    if m == 0 then return n end
+    if n == 0 then return m end
+    local prev = {}
+    for j = 0, n do prev[j] = j end
+    for i = 1, m do
+        local cur = { [0] = i }
+        local ai = a:byte(i)
+        for j = 1, n do
+            local cost = (b:byte(j) == ai) and 0 or 1
+            cur[j] = math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        end
+        prev = cur
+    end
+    return prev[n]
+end
+
+-- Lowercase alpha tokens of a tool name: "chrome-devtools_Take_Snapshot"
+-- -> chrome, devtools, take, snapshot.
+local function name_tokens(name)
+    local tokens = {}
+    for tok in tostring(name or ""):lower():gmatch("[%a][%a%d]*") do
+        tokens[tok] = true
+    end
+    return tokens
+end
+
+-- Server prefix of an MCP-style tool name: everything before the first '_'
+-- ("chrome-devtools" in "chrome-devtools_take_snapshot"), else "".
+local function server_prefix(name)
+    return tostring(name or ""):match("^[^_]+") or ""
+end
+
+-- Alpha tokens of the part AFTER the server prefix: for rematching we want
+-- distinctive intent tokens ("snapshot" for chrome-devtools_Take_Snapshot),
+-- not the server name itself ("chrome"/"devtools" which every same-server
+-- tool shares).
+local function suffix_tokens(name)
+    local n = tostring(name or "")
+    local p = server_prefix(n)
+    if p ~= "" and #n > #p + 1 and n:sub(#p + 1, #p + 1) == "_" then
+        n = n:sub(#p + 2)
+    end
+    return name_tokens(n)
+end
+
+-- Appends one guard decision to logs/toolname_fixes.jsonl for postmortems.
+local function log_toolname_fix(bogus, action, mapped, model)
+    local entry = {
+        time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        model = model,
+        bogus = bogus,
+        action = action,
+        mapped = mapped,
+    }
+    local f, err = io.open(TOOLNAME_LOG, "a")
+    if f then
+        f:write(cjson.encode(entry) .. "\n")
+        f:close()
+    else
+        ngx.log(ngx.WARN, "failed to open toolname log " .. TOOLNAME_LOG .. ": " .. tostring(err))
+    end
+end
+
+-- Tool-name guard for tool calls extracted from response markup (reasoning or
+-- content fields). Hallucinated names lifted from such markup used to flow
+-- straight into OpenAI-style tool_calls; a client that cannot resolve them
+-- (e.g. OpenCode) is then left with a broken turn. With allowed = the
+-- request's tools[].function.name list (nil skips the check), every such call
+-- is:
+--   kept     when its name is in the allowed set;
+--   remapped (mode "remap") to one assured real tool when confidently
+--            matching:
+--              R1: levenshtein(name, candidate) <= 2 with a unique minimum,
+--              R2: same server prefix and >= 1 shared alpha token (len >= 5)
+--                  with exactly one candidate matching in that server;
+--   dropped  otherwise: removed from the emission and reported via a
+--            corrective note appended to the content (the client sees what
+--            was skipped instead of unparseable markup / a bogus tool part).
+-- Returns (kept, dropped, n_remap, n_strip). dropped holds the original bogus
+-- names (one entry per dropped call, duplicates included). When noisy is
+-- false (probe runs, e.g. analyze_response before a silent resend), decisions
+-- are not written to the toolname log.
+local function guard_tool_calls(calls, allowed, model, noisy)
+    if not allowed or TOOL_NAME_GUARD == "off" then
+        return calls, {}, 0, 0
+    end
+
+    local kept, dropped = {}, {}
+    local n_remap, n_strip = 0, 0
+
+    local allowed_set = {}
+    local allowed_low = {}
+    for i = 1, #allowed do
+        allowed_set[allowed[i]] = true
+        allowed_low[i] = allowed[i]:lower()
+    end
+
+    for _, call in ipairs(calls) do
+        local name = tostring(call.name or "")
+        if allowed_set[name] then
+            kept[#kept + 1] = call
+        elseif TOOL_NAME_GUARD == "remap" and name ~= "" then
+            local mapped = nil
+
+            -- R1: closest allowed name within distance 2, unique minimum.
+            local lname = name:lower()
+            local best, bd, bd_count = nil, nil, 0
+            for i = 1, #allowed do
+                local d = levenshtein(lname, allowed_low[i])
+                if bd == nil or d < bd then
+                    best, bd, bd_count = allowed[i], d, 1
+                elseif d == bd then
+                    bd_count = bd_count + 1
+                end
+            end
+            if bd ~= nil and bd <= 2 and bd_count == 1 then
+                mapped = best
+            end
+
+            -- R2: same server prefix, >= 1 shared distinctive token (len >= 5)
+            -- after the server prefix, exactly one candidate in that server.
+            if not mapped then
+                local prefix = server_prefix(name)
+                if prefix ~= "" then
+                    local btokens = suffix_tokens(name)
+                    local cands = {}
+                    for i = 1, #allowed do
+                        if allowed[i] ~= name and server_prefix(allowed[i]) == prefix then
+                            local ctokens = suffix_tokens(allowed[i])
+                            for tok in pairs(btokens) do
+                                if #tok >= 5 and ctokens[tok] then
+                                    cands[allowed[i]] = true
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    local n, c1 = 0, nil
+                    for c in pairs(cands) do
+                        n = n + 1
+                        c1 = c
+                    end
+                    if n == 1 then mapped = c1 end
+                end
+            end
+
+            if mapped then
+                n_remap = n_remap + 1
+                if noisy ~= false then log_toolname_fix(name, "remap", mapped, model) end
+                kept[#kept + 1] = { id = call.id, name = mapped, arguments = call.arguments }
+            else
+                n_strip = n_strip + 1
+                if noisy ~= false then log_toolname_fix(name, "drop", "", model) end
+                dropped[#dropped + 1] = name
+            end
+        else
+            n_strip = n_strip + 1
+            if name ~= "" and noisy ~= false then log_toolname_fix(name, "drop", "", model) end
+            dropped[#dropped + 1] = name
+        end
+    end
+
+    return kept, dropped, n_remap, n_strip
+end
+
+-- Pure (silent) probe used before the optional one-shot resend: returns how
+-- many markup-converted calls the guard would remap / would strip from this
+-- response object, without logging or emitting anything.
+local function analyze_response(obj, allowed)
+    if not obj or not allowed then return 0, 0 end
+    local choice = obj.choices and obj.choices[1]
+    local msg = choice and choice.message
+    if not msg then return 0, 0 end
+    local calls_r = extract_tool_calls(field_str(msg.reasoning))
+    local calls_c = extract_tool_calls(field_str(msg.content))
+    if #calls_r == 0 and #calls_c == 0 then return 0, 0 end
+    local _, _, remap_r, strip_r = guard_tool_calls(calls_r, allowed, obj.model, false)
+    local _, _, remap_c, strip_c = guard_tool_calls(calls_c, allowed, obj.model, false)
+    return remap_r + remap_c, strip_r + strip_c
+end
+
 -- Writes a request/response dump to LOG_DIR/<unix-ms>.<kind>.json. Dumping
 -- must never break the proxy path, so write errors are only logged.
 local function dump(ts, kind, data)
@@ -431,10 +649,42 @@ local function emit_chat_stream(obj)
     end
     local stripped_r, calls_r = strip_tool_calls(reasoning)
     reasoning = stripped_r
-    for i = 1, #calls_r do calls[#calls + 1] = calls_r[i] end
     local stripped_c, calls_c = strip_tool_calls(content)
     content = stripped_c
-    for i = 1, #calls_c do calls[#calls + 1] = calls_c[i] end
+
+    -- Markup-converted calls go through the tool-name guard: text lifted from
+    -- the content/reasoning markup is exactly where hallucinated tool names
+    -- appear. API-level message.tool_calls above pass through untouched (the
+    -- client already handles those, including unknown-name recovery).
+    local kept_r, drop_r, remap_r, strip_r = guard_tool_calls(calls_r, ngx.ctx._tool_names, obj.model)
+    local kept_c, drop_c, remap_c, strip_c = guard_tool_calls(calls_c, ngx.ctx._tool_names, obj.model)
+    local fix_remaps = remap_r + remap_c
+    local fix_strips = strip_r + strip_c
+    local fix_names = {}
+    for i = 1, #drop_r do fix_names[#fix_names + 1] = drop_r[i] end
+    for i = 1, #drop_c do fix_names[#fix_names + 1] = drop_c[i] end
+    for i = 1, #kept_r do calls[#calls + 1] = kept_r[i] end
+    for i = 1, #kept_c do calls[#calls + 1] = kept_c[i] end
+
+    if fix_remaps > 0 or fix_strips > 0 then
+        ngx.ctx._toolname_remap = (ngx.ctx._toolname_remap or 0) + fix_remaps
+        ngx.ctx._toolname_strip = (ngx.ctx._toolname_strip or 0) + fix_strips
+    end
+
+    if fix_strips > 0 then
+        local uniq, listed = {}, {}
+        for i = 1, #fix_names do
+            local nf = tostring(fix_names[i] or "")
+            if not uniq[nf] then
+                uniq[nf] = true
+                listed[#listed + 1] = "`" .. nf .. "`"
+            end
+        end
+        local verb = (#listed == 1) and " is not an available tool." or " are not available tools."
+        local note = TOOLNAME_NOTE .. " Tool call skipped: " .. table.concat(listed, ", ") .. verb
+            .. " Double-check the tool name and continue with the correct available tool."
+        content = (content == "") and note or (content .. "\n\n" .. note)
+    end
 
     if #calls > 0 then finish_reason = "tool_calls" end
 
@@ -777,6 +1027,25 @@ function _M.completions()
     ngx.ctx._keepalive_created = math.floor(ngx.now())
     ngx.ctx._req_model = type(obj.model) == "string" and obj.model or nil
 
+    -- Tool names allowed by the request, consumed by the tool-name guard when
+    -- converting markup calls to tool_calls (see guard_tool_calls). A missing
+    -- "tools" array leaves _tool_names nil, which skips the guard: there is
+    -- nothing to validate against on plain completions requests. An empty
+    -- array yields an empty list: every markup-converted call is then dropped.
+    ngx.ctx._tool_names = nil
+    if type(obj.tools) == "table" then
+        local names, seen = {}, {}
+        for i = 1, #obj.tools do
+            local fn = obj.tools[i] and obj.tools[i]["function"]
+            local name = type(fn) == "table" and not is_null(fn.name) and fn.name or nil
+            if type(name) == "string" and name ~= "" and not seen[name] then
+                seen[name] = true
+                names[#names + 1] = name
+            end
+        end
+        ngx.ctx._tool_names = names
+    end
+
     -- Register the abort handler before the cool-down stall so a client
     -- disconnect during the stall (or while waiting for the upstream) is
     -- noticed. The callback runs in a separate light thread, so it must only
@@ -955,6 +1224,93 @@ function _M.completions()
         end
     end
 
+    -- Tool-name guard's silent self-heal: when the guard would strip any
+    -- markup-converted call (hallucinated names), resend the identical
+    -- request once and adopt the fresh sample when it comes back as a clean
+    -- chat completion. Nothing payload-bearing reached the client yet (only
+    -- empty SSE heartbeats), so the retry is invisible to it. On any retry
+    -- failure or a still-hallucinated response the original body stays
+    -- (the guard then remaps/demotes as configured at emission time).
+    if TOOL_NAME_RETRY and jobj and want_stream
+        and ngx.ctx._tool_names and #ngx.ctx._tool_names > 0
+        and not state.aborted then
+        local _, nstrip = analyze_response(jobj, ngx.ctx._tool_names)
+        if nstrip > 0 then
+            ngx.log(ngx.WARN, "tool-name guard: may strip " .. nstrip
+                .. " call(s), resending the request once")
+            ngx.ctx._toolname_resend = (ngx.ctx._toolname_resend or 0) + 1
+            local sock2 = ngx.socket.tcp()
+            sock2:settimeout(POLL_MS)
+            local okc2, c2 = sock2:connect(host, tonumber(port))
+            if not okc2 then
+                ngx.log(ngx.WARN, "tool-name retry: reconnect failed: " .. tostring(c2))
+            elseif state.aborted then
+                sock2:close()
+            else
+                local okw2, w2err = sock2:send(request)
+                if not okw2 then
+                    if not state.aborted then
+                        ngx.log(ngx.WARN, "tool-name retry: send failed: " .. tostring(w2err))
+                        sock2:close()
+                    end
+                elseif state.aborted then
+                    sock2:close()
+                else
+                    local sl2 = recv_line_poll(sock2, state, send_keepalive)
+                    if sl2 and not state.aborted then
+                        local st2 = tonumber(sl2:match("^HTTP/%d+%.?%d*%s+(%d+)")) or 500
+                        local hd2 = {}
+                        local cl2, ch2
+                        while not state.aborted do
+                            local ln = recv_line_poll(sock2, state, send_keepalive)
+                            if not ln or ln == "" then break end
+                            local nm, vv = ln:match("^([^:]+):%s*(.*)$")
+                            if nm then
+                                hd2[string.lower(nm)] = vv
+                                if string.lower(nm) == "content-length" then cl2 = tonumber(vv) end
+                                if string.lower(nm) == "transfer-encoding" and vv:lower():find("chunked", 1, true) then
+                                    ch2 = true
+                                end
+                            end
+                        end
+                        if not state.aborted then
+                            local b2
+                            if ch2 then
+                                b2 = receive_chunked_poll(sock2, state, send_keepalive)
+                            elseif cl2 then
+                                b2 = recv_bytes_poll(sock2, cl2, state, send_keepalive)
+                            else
+                                b2 = receive_until_close_poll(sock2, state, send_keepalive)
+                            end
+                            if b2 then
+                                dump(ts, "resp.2", b2)
+                                if st2 == 200 and b2 ~= "" then
+                                    local okj2, dec2 = pcall(cjson.decode, b2)
+                                    local chat2 = okj2 and type(dec2) == "table"
+                                        and type(dec2.choices) == "table" and dec2.choices[1] ~= nil
+                                    if chat2 then
+                                        body, status, headers, jobj = b2, st2, hd2, dec2
+                                        ngx.ctx._upstream_status = st2
+                                        ngx.ctx._resp_usage = dec2.usage
+                                        ngx.ctx._resp_model = dec2.model
+                                    else
+                                        ngx.log(ngx.WARN, "tool-name retry: non-chat response, keeping original")
+                                    end
+                                else
+                                    ngx.log(ngx.WARN, "tool-name retry: status " .. st2 .. ", keeping original")
+                                end
+                            end
+                        end
+                    end
+                    sock2:close()
+                end
+            end
+            if state.aborted then
+                return ngx.exit(444)
+            end
+        end
+    end
+
     if want_stream and ngx.ctx._sse_started then
         -- The SSE handshake was already sent (the upstream took longer than
         -- KEEPALIVE_DELAY); a non-200 result is relayed as an SSE event so
@@ -1068,6 +1424,10 @@ function _M.log_request()
             duration_ms = math.floor(((c._upstream_done or ended) - sent_at) * 1000 + 0.5),
         }
 
+        if c._toolname_remap and c._toolname_remap > 0 then entry.toolname_remap = c._toolname_remap end
+        if c._toolname_strip and c._toolname_strip > 0 then entry.toolname_strip = c._toolname_strip end
+        if c._toolname_resend and c._toolname_resend > 0 then entry.toolname_resend = c._toolname_resend end
+
         local f, err = io.open(STATS_LOG, "a")
         if not f then
             ngx.log(ngx.ERR, "failed to open stats log " .. STATS_LOG .. ": " .. tostring(err))
@@ -1102,5 +1462,10 @@ function _M.log_request()
     f:write(cjson.encode(entry) .. "\n")
     f:close()
 end
+
+-- Test hooks: exposed for the container selftest (nginx/lua/selftest.lua);
+-- not used by the request path.
+_M._extract_tool_calls = extract_tool_calls
+_M._emit_chat_stream = emit_chat_stream
 
 return _M

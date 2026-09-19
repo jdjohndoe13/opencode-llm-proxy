@@ -102,6 +102,8 @@ cp .env.example .env
 | `TEMP_CHECK_STALL_LOG` | Path (inside the container) where stall records are written |
 | `KEEPALIVE_DELAY` | Seconds after the request was received before the SSE handshake and the first heartbeat are sent |
 | `KEEPALIVE_INTERVAL` | Seconds between heartbeat chunks while the upstream is still generating |
+| `TOOL_NAME_GUARD` | `remap` (default), `strip` or `off`. When tools are defined, markup-style tool calls in the response (including the `antml:` namespace) are converted to real `tool_calls` and their names validated against the request's tool list: `remap` fixes a hallucinated name when a unique allowed candidate exists (edit distance ≤ 2, or a unique shared intent token ≥ 5 chars within the same `server_` prefix), `strip` always drops unknown names. Dropped calls are replaced by a corrective note in the assistant content tagged `[tool-name-fixer]`; every decision is logged to `logs/toolname_fixes.jsonl` |
+| `TOOL_NAME_RETRY` | `1` (default) or `0`. When `1` and the guard would strip anything, the identical request is silently resent once (only empty heartbeat chunks have reached the client at that point) and the fresh sample is adopted if it comes back as a clean chat completion; otherwise the original response is demoted as above. Decisions appear in `logs/*.jsonl` stats (`toolname_resend`) and nginx warnings |
 
 When `TEMP_CHECK_ENABLED` is `1`/`true`, the other `TEMP_CHECK_*` variables
 are required — the container refuses to start if any is missing. `LLM_BACKEND`,

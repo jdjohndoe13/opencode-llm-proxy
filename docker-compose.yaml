@@ -12,6 +12,16 @@ services:
       # top_p forced onto rewritten request bodies. Negative (the default)
       # leaves the client's top_p untouched.
       TOP_P: ${TOP_P:--1}
+      # Tool-name guard for markup tool calls: "remap" (default) fixes a
+      # hallucinated name when a unique allowed candidate exists, otherwise
+      # drops it; "strip" always drops unknown names; "off" disables checking
+      # entirely. Any dropped call is replaced by a corrective note in the
+      # assistant content. TOOL_NAME_RETRY additionally resends the identical
+      # request once when anything would be dropped (nothing payload-bearing
+      # reached the client yet) and adopts the fresh sample when it comes
+      # back clean.
+      TOOL_NAME_GUARD: ${TOOL_NAME_GUARD:-remap}
+      TOOL_NAME_RETRY: ${TOOL_NAME_RETRY:-1}
       # GPU temperature checks (cool-down guard). Disabled by default: when
       # TEMP_CHECK_ENABLED is unset or anything other than "1" / "true"
       # (case-insensitive) the checks are off and every other TEMP_CHECK_*
