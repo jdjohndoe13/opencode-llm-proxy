@@ -37,6 +37,15 @@ server {
     # clients with first-byte timeouts don't abort the stream.
     set $keepalive_delay ${KEEPALIVE_DELAY};
     set $keepalive_interval ${KEEPALIVE_INTERVAL};
+
+    # Upstream exchange deadline / resend (completions.lua): each attempt gets
+    # UPSTREAM_TIMEOUT seconds to respond (connect + send + full response);
+    # when the deadline expires without a (complete) response, the cosocket is
+    # dropped and the identical request is resent, up to UPSTREAM_RETRIES
+    # times.
+    set $upstream_timeout ${UPSTREAM_TIMEOUT};
+    set $upstream_retries ${UPSTREAM_RETRIES};
+
     set $tool_name_guard ${TOOL_NAME_GUARD};
     set $tool_name_retry ${TOOL_NAME_RETRY};
 

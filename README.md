@@ -102,12 +102,15 @@ cp .env.example .env
 | `TEMP_CHECK_STALL_LOG` | Path (inside the container) where stall records are written |
 | `KEEPALIVE_DELAY` | Seconds after the request was received before the SSE handshake and the first heartbeat are sent |
 | `KEEPALIVE_INTERVAL` | Seconds between heartbeat chunks while the upstream is still generating |
+| `UPSTREAM_TIMEOUT` | Seconds each upstream attempt (connect + send + full response) has to answer; when it expires without a (complete) response, the connection is dropped |
+| `UPSTREAM_RETRIES` | How many times the identical request is resent after such a timeout (a request is sent at most `UPSTREAM_RETRIES + 1` times) |
 | `TOOL_NAME_GUARD` | `remap` (default), `strip` or `off`. When tools are defined, markup-style tool calls in the response (including the `antml:` namespace) are converted to real `tool_calls` and their names validated against the request's tool list: `remap` fixes a hallucinated name when a unique allowed candidate exists (edit distance ≤ 2, or a unique shared intent token ≥ 5 chars within the same `server_` prefix), `strip` always drops unknown names. Dropped calls are replaced by a corrective note in the assistant content tagged `[tool-name-fixer]`; every decision is logged to `logs/toolname_fixes.jsonl` |
 | `TOOL_NAME_RETRY` | `1` (default) or `0`. When `1` and the guard would strip anything, the identical request is silently resent once (only empty heartbeat chunks have reached the client at that point) and the fresh sample is adopted if it comes back as a clean chat completion; otherwise the original response is demoted as above. Decisions appear in `logs/*.jsonl` stats (`toolname_resend`) and nginx warnings |
 
 When `TEMP_CHECK_ENABLED` is `1`/`true`, the other `TEMP_CHECK_*` variables
 are required — the container refuses to start if any is missing. `LLM_BACKEND`,
-`KEEPALIVE_DELAY` and `KEEPALIVE_INTERVAL` are always required.
+`KEEPALIVE_DELAY`, `KEEPALIVE_INTERVAL`, `UPSTREAM_TIMEOUT` and
+`UPSTREAM_RETRIES` are always required.
 
 To point the proxy at a different backend, edit `LLM_BACKEND` in `.env` and
 restart (see below).
@@ -200,9 +203,13 @@ the foreground.
 7. The modified body is sent to the backend over a cosocket, carrying the
    original request headers except `Host`, `Content-Length`, `Connection`
    and `Accept-Encoding` (`Host` is set to `LLM_BACKEND`, identity encoding
-   is forced). The upstream response is buffered in full, dumped to
-   `logs/<unix-ms>.resp.json`, and its status, `Content-Type` and
-   `Cache-Control` are relayed to the client.
+   is forced). Each attempt gets `UPSTREAM_TIMEOUT` seconds to answer
+   (connect + send + full buffered response); if the upstream has not
+   finished responding within it, the cosocket is dropped and the identical
+   request is resent, up to `UPSTREAM_RETRIES` times, with the empty SSE
+   heartbeats for streaming clients continuing meanwhile. The upstream
+   response is buffered in full, dumped to `logs/<unix-ms>.resp.json`, and
+   its status, `Content-Type` and `Cache-Control` are relayed to the client.
 8. When the client asked for `stream: true`, the SSE handshake is deferred
    until `KEEPALIVE_DELAY` seconds after the request was received; empty
    heartbeat chunks are then emitted every `KEEPALIVE_INTERVAL` seconds

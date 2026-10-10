@@ -130,6 +130,7 @@ ngx_mock = {
     var = {
         temp_check_enabled = "0", top_p = "-1",
         keepalive_delay = "30", keepalive_interval = "5",
+        upstream_timeout = "600", upstream_retries = "1",
         tool_name_guard = "remap",
     },
     socket = {},

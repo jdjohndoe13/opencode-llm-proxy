@@ -99,6 +99,22 @@ end
 local KEEPALIVE_DELAY = require_number("keepalive_delay", ngx.var.keepalive_delay)
 local KEEPALIVE_INTERVAL = require_number("keepalive_interval", ngx.var.keepalive_interval)
 
+-- Upstream response deadline and resend budget: every attempt to the proxied
+-- server (connect + send + full buffered response) gets UPSTREAM_TIMEOUT
+-- seconds to answer; when that expires, the cosocket is dropped and the
+-- identical request is resent, up to UPSTREAM_RETRIES times after the first
+-- failure (so a request is sent at most UPSTREAM_RETRIES + 1 times). Both
+-- values deliberately have no defaults: like KEEPALIVE_*, the container must
+-- supply them (see .env).
+local UPSTREAM_TIMEOUT = require_number("upstream_timeout", ngx.var.upstream_timeout)
+if UPSTREAM_TIMEOUT <= 0 then
+    error("upstream_timeout must be greater than 0 seconds, got: " .. tostring(ngx.var.upstream_timeout), 2)
+end
+local UPSTREAM_RETRIES = require_number("upstream_retries", ngx.var.upstream_retries)
+if UPSTREAM_RETRIES ~= math.floor(UPSTREAM_RETRIES) or UPSTREAM_RETRIES < 0 then
+    error("upstream_retries must be a non-negative integer, got: " .. tostring(ngx.var.upstream_retries), 2)
+end
+
 -- Tool-name guard for tool calls converted from response markup (see
 -- guard_tool_calls). Request tools are taken from the request body's
 -- "tools[].function.name" list.
@@ -754,12 +770,22 @@ end
 -- (which owns the cosocket) can close the upstream connection itself.
 -- on_wait, when given, is called on every receive timeout so the caller can
 -- keep the client's first-byte timeout at bay (e.g. emit keep-alive chunks).
+-- state.deadline, when set, is the overall per-attempt response deadline
+-- (UPSTREAM_TIMEOUT, seconds since ngx.now()): once it has passed while the
+-- socket stays idle, the pollers stop polling and report the failure as
+-- nil, "timeout" so the caller can drop the connection and retry the
+-- request.
+local function deadline_exceeded(state)
+    return state.deadline ~= nil and ngx.now() > state.deadline
+end
+
 local function recv_line_poll(sock, state, on_wait)
     while true do
         if state.aborted then return nil, "aborted" end
         local line, err = sock:receive("*l")
         if line then return line, nil end
         if err ~= "timeout" then return nil, err end
+        if deadline_exceeded(state) then return nil, "timeout" end
         if on_wait then on_wait() end
     end
 end
@@ -775,6 +801,8 @@ local function recv_bytes_poll(sock, n, state, on_wait)
             got = got + #data
         elseif err ~= "timeout" then
             return nil, err
+        elseif deadline_exceeded(state) then
+            return nil, "timeout"
         elseif on_wait then
             on_wait()
         end
@@ -814,7 +842,9 @@ local function receive_until_close_poll(sock, state, on_wait)
         if data then
             parts[#parts + 1] = data
         elseif err == "timeout" then
-            -- keep polling the abort flag / keep-alive cadence
+            -- keep polling the abort flag / keep-alive cadence, until the
+            -- per-attempt response deadline (UPSTREAM_TIMEOUT) expires
+            if deadline_exceeded(state) then return nil, "timeout" end
             if on_wait then on_wait() end
         elseif err == "closed" then
             break
@@ -1092,20 +1122,6 @@ function _M.completions()
         host, port = backend, "80"
     end
 
-    local sock = ngx.socket.tcp()
-    sock:settimeout(POLL_MS)
-
-    local okc, cerr = sock:connect(host, tonumber(port))
-    if not okc then
-        ngx.log(ngx.ERR, "connect to " .. backend .. " failed: " .. tostring(cerr))
-        if ngx.ctx._sse_started then
-            sse_error("upstream connect failed: " .. tostring(cerr))
-            sse("[DONE]")
-            return ngx.exit(ngx.HTTP_OK)
-        end
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-    end
-
     local lines = { ngx.req.get_method() .. " " .. path .. " HTTP/1.1", "Host: " .. backend }
     local h = ngx.req.get_headers()
     local skip = { host = true, ["content-length"] = true, connection = true, ["accept-encoding"] = true }
@@ -1122,91 +1138,147 @@ function _M.completions()
     lines[#lines + 1] = "Accept-Encoding: identity"
     lines[#lines + 1] = "Connection: close"
     lines[#lines + 1] = "Content-Length: " .. #new_body
+    -- Full request message, built once and resent verbatim on every attempt
+    -- (see the retry loop below).
     local request = table.concat(lines, "\r\n") .. "\r\n\r\n" .. new_body
 
-    local okw, werr = sock:send(request)
-    if not okw then
-        if state.aborted then
-            ngx.log(ngx.INFO, "client aborted, discarding upstream send error")
-            return ngx.exit(444)
-        end
-        ngx.log(ngx.ERR, "failed to send request to " .. backend .. ": " .. tostring(werr))
-        sock:close()
-        if ngx.ctx._sse_started then
-            sse_error("upstream send failed: " .. tostring(werr))
-            sse("[DONE]")
-            return ngx.exit(ngx.HTTP_OK)
-        end
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-    end
+    -- Upstream exchange with timeout-driven resend: each attempt gets
+    -- UPSTREAM_TIMEOUT seconds to answer (connect + send + full buffered
+    -- response; the recv pollers above turn idle timeouts into a "timeout"
+    -- error once the per-attempt deadline has passed). When an attempt fails
+    -- on that deadline only, the connection is dropped and the request is
+    -- resent, up to UPSTREAM_RETRIES times. All other failures (connect or
+    -- send errors, premature closes) and a client abort remain fatal, and
+    -- keep-alive chunks keep flowing to streaming clients the whole time.
+    local attempts = UPSTREAM_RETRIES + 1
+    local body, status, headers
 
-    local status_line, sl_err = recv_line_poll(sock, state, send_keepalive)
-    if not status_line then
-        if state.aborted then
-            ngx.log(ngx.INFO, "client aborted, closing upstream connection")
+    for attempt = 1, attempts do
+        state.deadline = ngx.now() + UPSTREAM_TIMEOUT
+
+        local sock = ngx.socket.tcp()
+        sock:settimeout(POLL_MS)
+
+        local okc, cerr = sock:connect(host, tonumber(port))
+        if not okc then
+            if state.aborted then
+                ngx.log(ngx.INFO, "client aborted, discarding upstream connect error")
+                return ngx.exit(444)
+            end
+            ngx.log(ngx.ERR, "connect to " .. backend .. " failed: " .. tostring(cerr))
+            if ngx.ctx._sse_started then
+                sse_error("upstream connect failed: " .. tostring(cerr))
+                sse("[DONE]")
+                return ngx.exit(ngx.HTTP_OK)
+            end
+            return ngx.exit(ngx.HTTP_BAD_GATEWAY)
+        end
+
+        local okw, werr = sock:send(request)
+        if not okw then
+            if state.aborted then
+                ngx.log(ngx.INFO, "client aborted, discarding upstream send error")
+                return ngx.exit(444)
+            end
+            ngx.log(ngx.ERR, "failed to send request to " .. backend .. ": " .. tostring(werr))
             sock:close()
-            return ngx.exit(444)
+            if ngx.ctx._sse_started then
+                sse_error("upstream send failed: " .. tostring(werr))
+                sse("[DONE]")
+                return ngx.exit(ngx.HTTP_OK)
+            end
+            return ngx.exit(ngx.HTTP_BAD_GATEWAY)
         end
-        ngx.log(ngx.ERR, "failed to read status line from " .. backend .. ": " .. tostring(sl_err))
-        sock:close()
-        if ngx.ctx._sse_started then
-            sse_error("upstream error: " .. tostring(sl_err))
-            sse("[DONE]")
-            return ngx.exit(ngx.HTTP_OK)
+
+        local status_line, sl_err = recv_line_poll(sock, state, send_keepalive)
+        if not status_line then
+            if state.aborted then
+                ngx.log(ngx.INFO, "client aborted, closing upstream connection")
+                sock:close()
+                return ngx.exit(444)
+            end
+            sock:close()
+            if sl_err == "timeout" and attempt < attempts then
+                -- Deadline expired before the upstream answered anything:
+                -- drop the connection and send the identical request again.
+                ngx.log(ngx.WARN, "upstream did not respond within "
+                    .. UPSTREAM_TIMEOUT .. "s, dropping the connection and resending the request (attempt "
+                    .. (attempt + 1) .. " of " .. attempts .. ")")
+                ngx.ctx._upstream_retries = (ngx.ctx._upstream_retries or 0) + 1
+            else
+                ngx.log(ngx.ERR, "failed to read status line from " .. backend .. ": " .. tostring(sl_err))
+                if ngx.ctx._sse_started then
+                    sse_error("upstream error: " .. tostring(sl_err))
+                    sse("[DONE]")
+                    return ngx.exit(ngx.HTTP_OK)
+                end
+                return ngx.exit(ngx.HTTP_BAD_GATEWAY)
+            end
+        else
+            status = tonumber(status_line:match("^HTTP/%d+%.?%d*%s+(%d+)")) or 500
+            ngx.ctx._upstream_status = status
+            headers = {}
+            local content_length = nil
+            local chunked = false
+            while true do
+                if state.aborted then break end
+                local line, herr = recv_line_poll(sock, state, send_keepalive)
+                if not line then break end
+                if line == "" then break end
+                local name, value = line:match("^([^:]+):%s*(.*)$")
+                if name then
+                    headers[string.lower(name)] = value
+                    if string.lower(name) == "content-length" then content_length = tonumber(value) end
+                    if string.lower(name) == "transfer-encoding" and value:lower():find("chunked", 1, true) then chunked = true end
+                end
+            end
+            if state.aborted then
+                ngx.log(ngx.INFO, "client aborted, closing upstream connection")
+                sock:close()
+                return ngx.exit(444)
+            end
+
+            local body_err
+            if chunked then
+                body, body_err = receive_chunked_poll(sock, state, send_keepalive)
+            elseif content_length then
+                body, body_err = recv_bytes_poll(sock, content_length, state, send_keepalive)
+            else
+                body, body_err = receive_until_close_poll(sock, state, send_keepalive)
+            end
+
+            if state.aborted then
+                ngx.log(ngx.INFO, "client aborted, upstream connection closed")
+                sock:close()
+                return ngx.exit(444)
+            end
+
+            sock:close()
+
+            local retry_on_timeout = not body and body_err == "timeout" and attempt < attempts
+            if not body and not retry_on_timeout then
+                ngx.log(ngx.ERR, "failed to read response body from " .. backend .. ": " .. tostring(body_err))
+                if ngx.ctx._sse_started then
+                    sse_error("upstream read failed: " .. tostring(body_err))
+                    sse("[DONE]")
+                    return ngx.exit(ngx.HTTP_OK)
+                end
+                return ngx.exit(ngx.HTTP_BAD_GATEWAY)
+            end
+
+            if retry_on_timeout then
+                -- Response started but did not finish within the deadline:
+                -- drop it (a restart of generation the backend can observe)
+                -- and send the identical request again.
+                ngx.log(ngx.WARN, "upstream did not respond within "
+                    .. UPSTREAM_TIMEOUT .. "s, dropping the connection and resending the request (attempt "
+                    .. (attempt + 1) .. " of " .. attempts .. ")")
+                ngx.ctx._upstream_retries = (ngx.ctx._upstream_retries or 0) + 1
+            else
+                ngx.ctx._upstream_done = ngx.now() -- upstream exchange finished (body read or read failure)
+                break
+            end
         end
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-    end
-
-    local status = tonumber(status_line:match("^HTTP/%d+%.?%d*%s+(%d+)")) or 500
-    ngx.ctx._upstream_status = status
-    local headers = {}
-    local content_length = nil
-    local chunked = false
-    while true do
-        if state.aborted then break end
-        local line, herr = recv_line_poll(sock, state, send_keepalive)
-        if not line then break end
-        if line == "" then break end
-        local name, value = line:match("^([^:]+):%s*(.*)$")
-        if name then
-            headers[string.lower(name)] = value
-            if string.lower(name) == "content-length" then content_length = tonumber(value) end
-            if string.lower(name) == "transfer-encoding" and value:lower():find("chunked", 1, true) then chunked = true end
-        end
-    end
-    if state.aborted then
-        ngx.log(ngx.INFO, "client aborted, closing upstream connection")
-        sock:close()
-        return ngx.exit(444)
-    end
-
-    local body, err
-    if chunked then
-        body, err = receive_chunked_poll(sock, state, send_keepalive)
-    elseif content_length then
-        body, err = recv_bytes_poll(sock, content_length, state, send_keepalive)
-    else
-        body, err = receive_until_close_poll(sock, state, send_keepalive)
-    end
-
-    if state.aborted then
-        ngx.log(ngx.INFO, "client aborted, upstream connection closed")
-        sock:close()
-        return ngx.exit(444)
-    end
-
-    sock:close()
-    state.sock = nil
-    ngx.ctx._upstream_done = ngx.now() -- upstream exchange finished (body read or read failure)
-
-    if not body then
-        ngx.log(ngx.ERR, "failed to read response body from " .. backend .. ": " .. tostring(err))
-        if ngx.ctx._sse_started then
-            sse_error("upstream read failed: " .. tostring(err))
-            sse("[DONE]")
-            return ngx.exit(ngx.HTTP_OK)
-        end
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
     end
 
     dump(ts, "resp", body)
@@ -1239,6 +1311,11 @@ function _M.completions()
             ngx.log(ngx.WARN, "tool-name guard: may strip " .. nstrip
                 .. " call(s), resending the request once")
             ngx.ctx._toolname_resend = (ngx.ctx._toolname_resend or 0) + 1
+            -- The silent resend is also an upstream exchange, so bound it by
+            -- the same UPSTREAM_TIMEOUT window: on deadline timeout the
+            -- stale reads below come back empty and the original response is
+            -- kept.
+            state.deadline = ngx.now() + UPSTREAM_TIMEOUT
             local sock2 = ngx.socket.tcp()
             sock2:settimeout(POLL_MS)
             local okc2, c2 = sock2:connect(host, tonumber(port))
@@ -1427,6 +1504,10 @@ function _M.log_request()
         if c._toolname_remap and c._toolname_remap > 0 then entry.toolname_remap = c._toolname_remap end
         if c._toolname_strip and c._toolname_strip > 0 then entry.toolname_strip = c._toolname_strip end
         if c._toolname_resend and c._toolname_resend > 0 then entry.toolname_resend = c._toolname_resend end
+
+        -- Number of resends issued after upstream response timeouts (see
+        -- UPSTREAM_TIMEOUT / UPSTREAM_RETRIES in .env).
+        if c._upstream_retries and c._upstream_retries > 0 then entry.upstream_retries = c._upstream_retries end
 
         local f, err = io.open(STATS_LOG, "a")
         if not f then
