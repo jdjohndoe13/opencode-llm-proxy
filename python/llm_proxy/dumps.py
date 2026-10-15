@@ -13,7 +13,8 @@ log = logging.getLogger("llm_proxy.dump")
 
 
 def _json_line(obj: dict) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"),
+                      sort_keys=True)
 
 
 def _floor(x: float) -> int:
