@@ -269,6 +269,7 @@ async def completions(request: web.Request) -> web.StreamResponse:
         status, up_headers, body = await _drive_fetch(
             request.app, ctx, new_body, path, headers, commit)
     except UpstreamError as err:
+        log.warning("upstream error: %s", err)
         if commit.sse_started:
             await _send_sse(commit.resp, sse_mod.sse_error(str(err)))
             await _send_sse(commit.resp, "[DONE]")
@@ -482,8 +483,12 @@ def create_app(cfg: Config) -> web.Application:
                                  cfg.toolname_log)
 
     async def _session_ctx(app):
+        # force_close mirrors the Lua cosocket model: one fresh connection
+        # per request. Pooled keep-alives race the backend's idle-close and
+        # surface as instant 502s (ServerDisconnectedError on a dead socket).
         app["session"] = aiohttp.ClientSession(
-            auto_decompress=False)
+            auto_decompress=False,
+            connector=aiohttp.TCPConnector(force_close=True))
         yield
         await app["session"].close()
 
