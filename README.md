@@ -1,5 +1,27 @@
 # LLM Proxy (OpenResty + Lua)
 
+> **Python rewrite available.** The same proxy is implemented in Python
+> (aiohttp) under `python/` — same behavior, same `.env` variables, same
+> `logs/` file formats, port 9999. It exists to simplify debugging and
+> maintenance. Run it in parallel with the live service:
+>
+> ```bash
+> docker compose -f docker-compose.python.yaml up -d --build
+> ```
+>
+> or locally (tests on an off-port so the live proxy stays untouched):
+>
+> ```bash
+> cd python && pip install -r requirements.txt
+> LLM_BACKEND=host.docker.internal:21025 PORT=9998 KEEPALIVE_DELAY=30 \
+> KEEPALIVE_INTERVAL=5 UPSTREAM_TIMEOUT=600 UPSTREAM_RETRIES=1 \
+> LOG_DIR=../logs python -m llm_proxy
+> ```
+>
+> The OpenResty service defined by `docker-compose.yaml` remains the live
+> one until the swap is approved. `PORT` is honored by the Python service
+> only (the nginx config hardcodes 9999).
+
 A small reverse proxy built on the `openresty/openresty:alpine` image that
 sits in front of an LLM backend (e.g. a local vLLM server). It listens on
 port **9999** and forwards everything to the backend configured via the

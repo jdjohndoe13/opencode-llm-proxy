@@ -1,0 +1,46 @@
+# Python (aiohttp) rewrite of the LLM proxy.
+#
+# Same .env contract as the OpenResty service: copy .env.example to .env and
+# use the same variables. The live docker-compose.yaml is unchanged until the
+# swap is approved.
+#
+#   docker compose -f docker-compose.python.yaml up -d --build
+services:
+  llm-proxy:
+    build: ./python
+    container_name: llm-proxy-python
+    restart: unless-stopped
+    ports:
+      - "9999:9999"
+    environment:
+      # Required: backend host:port (e.g. host.docker.internal:21025).
+      LLM_BACKEND: ${LLM_BACKEND:?LLM_BACKEND must be set (copy .env.example to .env)}
+      # top_p forced onto rewritten request bodies. Negative (the default)
+      # leaves the client's top_p untouched.
+      TOP_P: ${TOP_P:--1}
+      # Tool-name guard: "remap" (default) | "strip" | "off".
+      TOOL_NAME_GUARD: ${TOOL_NAME_GUARD:-remap}
+      # Silent one-shot resend when the guard would strip anything.
+      TOOL_NAME_RETRY: ${TOOL_NAME_RETRY:-1}
+      # GPU temperature guard (cool-down); "1"/"true" arms it, then all
+      # other TEMP_CHECK_* variables become required.
+      TEMP_CHECK_ENABLED: ${TEMP_CHECK_ENABLED:-0}
+      TEMP_CHECK_ENDPOINT: ${TEMP_CHECK_ENDPOINT:-}
+      TEMP_CHECK_STALL_ABOVE: ${TEMP_CHECK_STALL_ABOVE:-}
+      TEMP_CHECK_RESUME_BELOW: ${TEMP_CHECK_RESUME_BELOW:-}
+      TEMP_CHECK_POLL_INTERVAL: ${TEMP_CHECK_POLL_INTERVAL:-}
+      TEMP_CHECK_CACHE_TTL: ${TEMP_CHECK_CACHE_TTL:-}
+      TEMP_CHECK_HTTP_TIMEOUT: ${TEMP_CHECK_HTTP_TIMEOUT:-}
+      TEMP_CHECK_STALL_LOG: ${TEMP_CHECK_STALL_LOG:-/var/log/nginx/completions/stall.log}
+      # Deferred SSE handshake + heartbeat cadence (seconds).
+      KEEPALIVE_DELAY: ${KEEPALIVE_DELAY:?KEEPALIVE_DELAY must be set (copy .env.example to .env)}
+      KEEPALIVE_INTERVAL: ${KEEPALIVE_INTERVAL:?KEEPALIVE_INTERVAL must be set (copy .env.example to .env)}
+      # Upstream exchange deadline / resend budget.
+      UPSTREAM_TIMEOUT: ${UPSTREAM_TIMEOUT:?UPSTREAM_TIMEOUT must be set (copy .env.example to .env)}
+      UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:?UPSTREAM_RETRIES must be set (copy .env.example to .env)}
+      # Where request/response dumps and stats.jsonl are written.
+      LOG_DIR: ${LOG_DIR:-/var/log/nginx/completions}
+    volumes:
+      - ./logs:/var/log/nginx/completions
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

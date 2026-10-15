@@ -1,2 +1,5 @@
 /logs
 .env
+__pycache__/
+ 
+.slim/deepwork/
