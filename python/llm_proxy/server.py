@@ -27,10 +27,12 @@ import time
 import aiohttp
 from aiohttp import web
 
-from . import dumps, sse as sse_mod
+from . import dashboard, dumps, sse as sse_mod
 from .config import Config, load
 from .dumps import dump, dump_ts
+from .inflight import InFlight
 from .markup import json_encode
+from .pause import PauseGate
 from .toolguard import ToolNameGuard, allowed_names
 from .tempguard import TempGuard
 
@@ -247,13 +249,54 @@ async def completions(request: web.Request) -> web.StreamResponse:
         model=obj.get("model") if isinstance(obj.get("model"), str) else "unknown",
     )
 
+    # In-flight registry (dashboard): one record per forwarded request,
+    # removed in stats_middleware's finally (covers every exit path,
+    # including cancellation).
+    inflight: InFlight = request.app["inflight"]
+    rec = inflight.add(
+        str(ts),
+        model=ctx["_req_model"],
+        path=request.path,
+        stream=want_stream)
+    ctx["_inflight"] = rec
+
+    # Manual pause gate (before the temp guard and the upstream): while
+    # paused the upstream is never touched — no connect attempts at all.
+    # Streaming clients keep the identical deferred handshake + heartbeat
+    # behavior (on_wait pumps the very same StreamCommit), non-stream
+    # clients receive no reply bytes and just hang until resumed or until
+    # their own timeout kills them. On resume the request proceeds
+    # normally (temp guard -> fetch).
+    pause_gate: PauseGate = request.app["pause_gate"]
+
+    async def _on_wait_pause() -> None:
+        if rec["state"] != "paused":
+            inflight.set_state(rec, "paused")
+        await commit.on_wait()
+
+    if not await pause_gate.wait_until_resumed(ctx, _on_wait_pause):
+        log.info("client aborted while the proxy was paused")
+        return web.Response(status=444)  # nginx "no response" analog
+    if rec["state"] == "paused":
+        inflight.set_state(rec, "waiting")
+
     # Cool-down guard (stalls with heartbeats for streaming clients).
     temp_guard: TempGuard = request.app["temp_guard"]
-    if not await temp_guard.wait_for_cool_down(ctx, commit.on_wait):
+
+    async def _on_wait_guard() -> None:
+        if ctx.get("_stall_start") and not ctx.get("_stall_end"):
+            if rec["state"] != "stalled":
+                inflight.set_state(rec, "stalled")
+        elif rec["state"] == "stalled":
+            inflight.set_state(rec, "waiting")
+        await commit.on_wait()
+
+    if not await temp_guard.wait_for_cool_down(ctx, _on_wait_guard):
         log.info("client aborted while stalling for cool-down")
         return web.Response(status=444)  # nginx "no response" analog
 
     ctx["_sent_at"] = time.time()
+    inflight.set_state(rec, "upstream")
 
     path = request.path
     if request.query_string:
@@ -454,6 +497,9 @@ async def stats_middleware(request, handler):
     try:
         resp = await handler(request)
     except asyncio.CancelledError:
+        # Set the flag before re-raising so a handler still suspended inside
+        # a wait loop (pause gate / temp guard) can observe ctx["_aborted"]
+        # on its next tick and unwind cleanly instead of hanging forever.
         ctx = request.get("_ctx") or {}
         ctx["_aborted"] = True
         ctx.setdefault("_final_status", 444)  # the Lua's 444 on abort
@@ -467,6 +513,12 @@ async def stats_middleware(request, handler):
         if ctx is not None:
             ctx["_ended"] = time.time()
             cfg = request.app["cfg"]
+            rec = ctx.get("_inflight")
+            if rec is not None:
+                try:
+                    request.app["inflight"].remove(rec["id"])
+                except Exception:
+                    log.exception("in-flight registry cleanup failed")
             try:
                 dumps.write_stats(cfg, ctx)
                 dumps.write_stall(cfg, ctx)
@@ -501,6 +553,8 @@ def create_app(cfg: Config) -> web.Application:
     app.router.add_route("*", "/health", _health)
     app.router.add_route("*", "/v1/completions", completions)
     app.router.add_route("*", "/v1/chat/completions", completions)
+    # Dashboard API + static UI must be registered BEFORE the catch-all.
+    dashboard.register(app)
     app.router.add_route("*", "/{tail:.*}", passthrough)
     return app
 

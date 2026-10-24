@@ -88,6 +88,8 @@ are still relayed as plain HTTP responses.
 ├── restart.sh                    # full restart helper (down + recreate)
 ├── stall_stats.py                # summarize logs/stall.log
 ├── logs/                         # request/response dumps + stats (gitignored)
+├── dashboard/                    # dashboard frontend (TS + Vite + pnpm,
+│                                 #   built in Docker; see Dashboard below)
 └── nginx/lua/
     ├── nginx.conf                # main config: Lua module, shared dict, resolver
     ├── default.conf.template     # server block (${...} substituted at startup)
@@ -269,6 +271,61 @@ Both files of one exchange share the same millisecond-precision Unix
 timestamp in their name. The `.gitignore` excludes the dump files. Dump
 write failures are logged to nginx's error log and never affect the proxied
 response.
+
+## Dashboard: pause / resume (Python service)
+
+The Python service serves a small ops dashboard at
+`http://localhost:9999/dashboard` with a pause/resume switch:
+
+- **Pause** — in-flight requests keep being served normally. Every *new*
+  `/v1/completions` / `/v1/chat/completions` request is held without ever
+  touching the backend: streaming clients get the identical deferred SSE
+  handshake and fake empty heartbeat chunks (as if the upstream were
+  slow), non-streaming clients just receive no reply until the proxy is
+  resumed or the client's own timeout fires.
+- **Resume** — the held requests are released and proceed normally
+  (temp guard, then upstream).
+
+The intended workflow: pause the proxy, reboot the LLM server, resume
+when the new server is up. Clients only ever see "the server is slow",
+never "the server is down". (Requests already in flight when the backend
+dies still fail — nothing the proxy can do about that.) The pause state
+is in-memory only: a proxy restart always boots running.
+
+The dashboard shows the pause state, live in-flight requests (model,
+stream, age, waiting/paused/stalled/upstream), the recent pause/resume
+events and the paginated request history read from `logs/stats.jsonl`
+(newest first; `paused_seconds` is recorded per request).
+
+API (plain JSON, no auth — localhost tool):
+
+```
+GET  /api/dashboard/state              paused, in-flight, keepalive, events
+POST /api/dashboard/pause              pause the proxy
+POST /api/dashboard/resume             resume the proxy
+GET  /api/dashboard/history?page=1&size=20   stats.jsonl tail, newest first
+GET  /api/dashboard/healthz            {ok:true} — proxy vs backend
+```
+
+### The frontend (TypeScript + Vite + pnpm, built in Docker)
+
+Source lives in `dashboard/` (no framework, plain TS). Node, pnpm and
+Vite are never needed on the host — the proxy image build (`python/
+Dockerfile`) starts from `node:22-alpine`, runs `pnpm install
+--frozen-lockfile && pnpm build` in Docker and copies the Vite output
+into the Python image, so `docker compose up -d --build` (or
+`./restart.sh`) is all it takes. The dashboard is served straight from
+the proxy — no extra service, no volume.
+
+For working on the frontend itself:
+
+```bash
+cd dashboard
+build.cmd        # Windows: build in Docker, extract dist/ (or ./build.sh)
+```
+
+`build.cmd` only regenerates `dashboard/dist/` (used for local
+non-Docker runs); it is not needed for the normal image build.
 
 ## Stall statistics
 

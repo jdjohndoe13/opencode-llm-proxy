@@ -7,7 +7,11 @@
 #   docker compose -f docker-compose.python.yaml up -d --build
 services:
   llm-proxy:
-    build: ./python
+    # Build context is the repo root: the image's node stage compiles the
+    # dashboard frontend (dashboard/) and bakes it into the Python image.
+    build:
+      context: .
+      dockerfile: python/Dockerfile
     container_name: llm-proxy-python
     restart: unless-stopped
     ports:

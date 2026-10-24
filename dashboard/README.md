@@ -1,0 +1,55 @@
+# llm-proxy dashboard
+
+Single-page ops console for the LLM proxy, served by the proxy itself at
+`/dashboard`. Plain TypeScript + Vite — no framework, no CDN fetches, fully
+offline-safe. Dark, high-density, monospace; hand-rolled CSS in one file.
+
+## Build (Docker only — no node/pnpm needed on the host)
+
+From this directory:
+
+```cmd
+build.cmd
+```
+
+which is exactly:
+
+```cmd
+docker build -t llm-proxy-dashboard .
+docker create --name tmp llm-proxy-dashboard
+docker cp tmp:/app/dist ./dist
+docker rm -f tmp
+```
+
+`docker build --output type=local,dest=dist .` works too — the release stage
+carries the dist at the filesystem root (note: that flow also drops a
+duplicate `app/dist` mirror alongside the files; `build.cmd` is the cleaner
+path).
+
+The resulting `dist/` is only needed for local (non-Docker) runs of the
+proxy: `python/llm_proxy/static/` is its fallback home. The normal
+deployment path does not need it at all — the proxy image build
+(`python/Dockerfile`, repo-root context) compiles this frontend itself
+(node:22-alpine + corepack pnpm) and bakes the output into the image.
+
+## Dev mode (only if you happen to have node + pnpm)
+
+```sh
+pnpm install
+pnpm dev        # vite dev server on :5173, proxies /api → http://localhost:9997
+pnpm build      # tsc --noEmit + vite build → dist/
+```
+
+## API consumed (same origin)
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/dashboard/state` | `{paused, paused_at, uptime_s, in_flight:[{id,model,path,stream,state,started_at,age_seconds,updated_at}], keepalive:{delay,interval}, events:[{ts,action}]}` (events newest first) |
+| `POST /api/dashboard/pause` | hold all new requests (two-step confirm in the UI) |
+| `POST /api/dashboard/resume` | release the hold |
+| `GET /api/dashboard/history?page=&size=` | `{total,page,size,pages,entries:[…]}` — server-side paginated request history from `stats.jsonl` |
+| `GET /api/dashboard/healthz` | `{ok, uptime_s}` |
+
+Every field is parsed defensively; if the backend is unreachable or drifts
+from the contract, the UI degrades to a "proxy unreachable" banner instead
+of throwing.

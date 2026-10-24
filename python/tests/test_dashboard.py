@@ -1,0 +1,363 @@
+"""E2E tests for the pause gate + dashboard API (same style as
+test_server_e2e.py: ephemeral ports only, the real proxy is never touched).
+"""
+import asyncio
+import json
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from llm_proxy.config import load
+from llm_proxy.dashboard import read_history
+from llm_proxy.server import create_app
+
+CHAT = {
+    "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
+    "model": "m",
+    "choices": [{"index": 0, "message": {"role": "assistant",
+                                         "content": "hello world",
+                                         "reasoning": ""},
+                 "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+              "total_tokens": 5},
+}
+
+
+def _cfg(tmp_path, backend, **over):
+    env = {
+        "LLM_BACKEND": backend, "KEEPALIVE_DELAY": "1",
+        "KEEPALIVE_INTERVAL": "1", "UPSTREAM_TIMEOUT": "5",
+        "UPSTREAM_RETRIES": "1", "LOG_DIR": str(tmp_path),
+    }
+    env.update(over)
+    return load(env)
+
+
+async def _start(tmp_path, handler=None, over=None):
+    """Proxy + mock backend that records call count. Returns (backend,
+    proxy, calls)."""
+    calls = {"n": 0}
+
+    async def chat(request):
+        calls["n"] += 1
+        if handler is not None:
+            return await handler(request)
+        return web.json_response(CHAT)
+
+    backend_app = web.Application()
+    backend_app.router.add_post("/v1/chat/completions", chat)
+    backend = TestServer(backend_app)
+    await backend.start_server()
+    cfg = _cfg(tmp_path, f"127.0.0.1:{backend.port}", **(over or {}))
+    proxy = TestClient(TestServer(create_app(cfg)))
+    await proxy.start_server()
+    return backend, proxy, calls
+
+
+async def _pause(proxy):
+    async with proxy.post("/api/dashboard/pause") as r:
+        assert r.status == 200
+        assert await r.json() == {"ok": True, "paused": True}
+
+
+async def _resume(proxy):
+    async with proxy.post("/api/dashboard/resume") as r:
+        assert r.status == 200
+        assert await r.json() == {"ok": True, "paused": False}
+
+
+async def _state(proxy):
+    async with proxy.get("/api/dashboard/state") as r:
+        assert r.status == 200
+        assert r.headers.get("Access-Control-Allow-Origin") == "*"
+        return await r.json()
+
+
+async def _collect(resp):
+    whole = ""
+    async for chunk in resp.content.iter_any():
+        whole += chunk.decode()
+    return whole
+
+
+def _content_of(whole):
+    out = ""
+    for line in whole.splitlines():
+        if line.startswith("data: ") and line != "data: [DONE]":
+            j = json.loads(line[6:])
+            ch = j.get("choices")
+            if ch and isinstance(ch[0].get("delta", {}).get("content"), str):
+                out += ch[0]["delta"]["content"]
+    return out
+
+
+def _is_heartbeat(line):
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        return False
+    try:
+        j = json.loads(line[6:])
+    except ValueError:
+        return False
+    ch = j.get("choices")
+    return bool(ch) and ch[0].get("delta") == {}
+
+
+# ------------------------------------------------------------------ stream
+
+def test_pause_streams_heartbeats_no_upstream_then_resume(tmp_path):
+    """stream:true while paused: SSE handshake + empty heartbeats arrive,
+    the backend is never touched; resume -> the real answer completes."""
+    async def main():
+        backend, proxy, calls = await _start(tmp_path)
+        try:
+            await _pause(proxy)
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "messages": [],
+                                 "stream": True}))
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+                assert r.headers["Content-Type"] == "text/event-stream"
+                # The deferred handshake commits ~KEEPALIVE_DELAY after the
+                # request and the first fake heartbeat arrives with it,
+                # while still paused and with NO upstream call.
+                first = (await asyncio.wait_for(r.content.read(4096), 5)).decode()
+                assert loop.time() - t0 < 4.0
+                assert _is_heartbeat(first.splitlines()[0])
+                assert calls["n"] == 0
+
+                # Heartbeats keep coming while paused (one more beat).
+                beat = (await asyncio.wait_for(r.content.read(4096), 5)).decode()
+                assert _is_heartbeat(beat.splitlines()[0])
+                assert calls["n"] == 0
+
+                await _resume(proxy)
+                rest = await _collect(r)
+            whole = first + beat + rest
+            assert _content_of(whole) == "hello world"
+            assert whole.rstrip().endswith("data: [DONE]")
+            assert calls["n"] == 1
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+# ---------------------------------------------------------------- non-stream
+
+def test_pause_nonstream_hangs_then_completes(tmp_path):
+    """Non-stream while paused: no response bytes at all; after resume the
+    request completes normally."""
+    async def main():
+        backend, proxy, calls = await _start(tmp_path)
+        try:
+            await _pause(proxy)
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "messages": [],
+                                 "stream": False}))
+            # No response headers arrive while paused (post() only resolves
+            # with the headers).
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 1.5)
+                done = True
+            except asyncio.TimeoutError:
+                done = False
+            assert not done, "paused request must not respond"
+            assert calls["n"] == 0, "no upstream call while paused"
+
+            # The registry knows about it, in the paused state.
+            st = await _state(proxy)
+            assert len(st["in_flight"]) == 1
+            assert st["in_flight"][0]["state"] == "paused"
+            assert st["in_flight"][0]["stream"] is False
+            assert st["in_flight"][0]["model"] == "m"
+            assert st["in_flight"][0]["age_seconds"] > 0
+
+            await _resume(proxy)
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+                body = await r.json()
+            assert body["object"] == "chat.completion"
+            assert calls["n"] == 1
+            # Registry cleaned once the request finished.
+            st = await _state(proxy)
+            assert st["in_flight"] == []
+            # paused_seconds recorded in stats.jsonl.
+            stats = (tmp_path / "stats.jsonl").read_text(encoding="utf-8")
+            entry = json.loads(stats.strip())
+            assert entry["paused_seconds"] > 0
+            assert entry["status"] == 200
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_client_abort_while_paused(tmp_path):
+    """Abort a stream request while paused (handshake already sent): the
+    handler unwinds cleanly, the registry is cleaned, the proxy lives."""
+    async def main():
+        backend, proxy, calls = await _start(tmp_path)
+        try:
+            await _pause(proxy)
+            r = await proxy.post(
+                "/v1/chat/completions",
+                json={"model": "m", "messages": [], "stream": True})
+            assert r.status == 200
+            # Read one heartbeat, then hang up.
+            await r.content.read(1024)
+            r.close()
+            await asyncio.sleep(0.8)
+            st = await _state(proxy)
+            assert st["in_flight"] == [], "registry must be cleaned on abort"
+            assert calls["n"] == 0
+            # Still alive and serving.
+            async with proxy.get("/health") as h:
+                assert await h.text() == "ok"
+            # A fresh request after resume still works.
+            await _resume(proxy)
+            async with proxy.post(
+                    "/v1/chat/completions",
+                    json={"model": "m", "stream": True}) as r2:
+                whole = await _collect(r2)
+            assert _content_of(whole) == "hello world"
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_inflight_before_pause_completes(tmp_path):
+    """Requests already in flight when the pause hits finish normally."""
+    async def slow(request):
+        await asyncio.sleep(0.8)
+        return web.json_response(CHAT)
+
+    async def main():
+        backend, proxy, calls = await _start(tmp_path, handler=slow)
+        try:
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            await asyncio.sleep(0.15)  # request is inside the upstream call
+            await _pause(proxy)
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+                body = await r.json()
+            assert body["object"] == "chat.completion"
+            assert calls["n"] == 1
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+# ------------------------------------------------------------------- state
+
+def test_state_endpoint_reflects_pause_resume(tmp_path):
+    async def main():
+        backend, proxy, _ = await _start(tmp_path)
+        try:
+            st = await _state(proxy)
+            assert st["paused"] is False
+            assert st["paused_at"] is None
+            assert st["in_flight"] == []
+            assert st["keepalive"] == {"delay": 1.0, "interval": 1.0}
+            assert st["uptime_s"] > 0
+            assert st["events"] == []
+
+            await _pause(proxy)
+            st = await _state(proxy)
+            assert st["paused"] is True
+            assert isinstance(st["paused_at"], (int, float))
+            assert [e["action"] for e in st["events"]] == ["pause"]
+
+            await _resume(proxy)
+            st = await _state(proxy)
+            assert st["paused"] is False
+            assert st["paused_at"] is None
+            assert [e["action"] for e in st["events"]] == ["resume", "pause"]
+
+            # healthz distinguishes the proxy from the backend
+            async with proxy.get("/api/dashboard/healthz") as r:
+                assert r.status == 200
+                assert (await r.json())["ok"] is True
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_dashboard_passthrough_untouched(tmp_path):
+    """The dashboard routes do not break the catch-all for other paths."""
+    async def main():
+        backend, proxy, _ = await _start(tmp_path)
+        try:
+            async with proxy.get("/v1/models") as r:
+                assert r.status == 404  # backend has no such route
+            # /dashboard serves the placeholder page
+            async with proxy.get("/dashboard") as r:
+                assert r.status == 200
+                text = await r.text()
+            assert "dashboard not built yet" in text
+            async with proxy.get("/dashboard/../../etc/passwd") as r:
+                assert r.status in (400, 404)
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+# ----------------------------------------------------------------- history
+
+def _write_stats(tmp_path, n, partial=False, junk=None):
+    lines = [json.dumps({"model": "m", "i": i, "status": 200})
+             for i in range(1, n + 1)]
+    if junk:
+        lines = lines[:junk[0]] + ["not json at all"] + lines[junk[0]:]
+    data = "\n".join(lines) + "\n"
+    if partial:
+        data += '{"model": "m", "i": 999'  # no trailing newline
+    (tmp_path / "stats.jsonl").write_text(data, encoding="utf-8")
+
+
+def test_history_pagination(tmp_path):
+    _write_stats(tmp_path, 45, partial=True)
+    p1 = read_history(tmp_path / "stats.jsonl", page=1, size=20)
+    assert p1["total"] == 45 and p1["pages"] == 3
+    assert [e["i"] for e in p1["entries"]] == list(range(45, 25, -1))
+    p2 = read_history(tmp_path / "stats.jsonl", page=2, size=20)
+    assert [e["i"] for e in p2["entries"]] == list(range(25, 5, -1))
+    p3 = read_history(tmp_path / "stats.jsonl", page=3, size=20)
+    assert [e["i"] for e in p3["entries"]] == list(range(5, 0, -1))
+    p4 = read_history(tmp_path / "stats.jsonl", page=4, size=20)
+    assert p4["entries"] == []
+    # unparseable lines are skipped, not fatal
+    _write_stats(tmp_path, 10, junk=(3,))
+    p = read_history(tmp_path / "stats.jsonl", page=1, size=100)
+    assert p["total"] == 11 and len(p["entries"]) == 10
+
+
+def test_history_missing_file(tmp_path):
+    p = read_history(tmp_path / "stats.jsonl", page=1, size=20)
+    assert p == {"total": 0, "page": 1, "size": 20, "pages": 0,
+                 "entries": []}
+
+
+def test_history_endpoint(tmp_path):
+    _write_stats(tmp_path, 25, partial=True)
+
+    async def main():
+        backend, proxy, _ = await _start(tmp_path)
+        try:
+            async with proxy.get(
+                    "/api/dashboard/history?page=1&size=10") as r:
+                assert r.status == 200
+                assert r.headers.get("Access-Control-Allow-Origin") == "*"
+                d = await r.json()
+            assert d["total"] == 25 and d["pages"] == 3
+            assert [e["i"] for e in d["entries"]] == list(range(25, 15, -1))
+            async with proxy.get(
+                    "/api/dashboard/history?page=2&size=10") as r:
+                d = await r.json()
+            assert [e["i"] for e in d["entries"]] == list(range(15, 5, -1))
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
