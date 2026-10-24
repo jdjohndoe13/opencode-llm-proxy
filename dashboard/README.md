@@ -44,9 +44,10 @@ pnpm build      # tsc --noEmit + vite build → dist/
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /api/dashboard/state` | `{paused, paused_at, uptime_s, in_flight:[{id,model,path,stream,state,started_at,age_seconds,updated_at}], keepalive:{delay,interval}, events:[{ts,action}]}` (events newest first) |
+| `GET /api/dashboard/state` | `{paused, paused_at, uptime_s, in_flight:[{id,model,path,stream,state,started_at,age_seconds,updated_at}], keepalive:{delay,interval}, events:[{ts,action}], temp_guard:{enabled,config_enabled,user_enabled,fail_open,max_temp,checked_at,last_error}}` (events newest first; `temp_guard` optional — the UI hides the strip when absent) |
 | `POST /api/dashboard/pause` | hold all new requests (two-step confirm in the UI) |
 | `POST /api/dashboard/resume` | release the hold |
+| `POST /api/dashboard/tempguard` | body `{"enabled":bool}` — flips the guard's `user_enabled` switch; `{"ok":true,"enabled":…}`; 400 on malformed body |
 | `GET /api/dashboard/history?page=&size=` | `{total,page,size,pages,entries:[…]}` — server-side paginated request history from `stats.jsonl` |
 | `GET /api/dashboard/healthz` | `{ok, uptime_s}` |
 

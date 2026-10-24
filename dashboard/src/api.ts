@@ -10,6 +10,7 @@ import type {
   HistoryPage,
   InFlightRequest,
   ProxyEvent,
+  TempGuard,
   ToggleResult,
 } from './types';
 
@@ -79,13 +80,17 @@ async function getJson(path: string, timeoutMs = 6000): Promise<unknown> {
   }
 }
 
-async function postJson(path: string, timeoutMs = 10000): Promise<unknown> {
+async function postJson(path: string, body?: unknown, timeoutMs = 10000): Promise<unknown> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(`${BASE}${path}`, {
       method: 'POST',
-      headers: { accept: 'application/json' },
+      headers: {
+        accept: 'application/json',
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
       cache: 'no-store',
       signal: ac.signal,
     });
@@ -130,13 +135,42 @@ export function parseState(raw: unknown): DashboardState {
     o['paused_at'] === null || o['paused_at'] === undefined
       ? null
       : num(o['paused_at'], NaN);
-  return {
+  const s: DashboardState = {
     paused: bool(o['paused']),
     paused_at: pausedAt === null || Number.isNaN(pausedAt) ? null : pausedAt,
     uptime_s: num(o['uptime_s']),
     in_flight: arr(o['in_flight']).map(parseInFlight),
     keepalive: { delay: num(ka['delay']), interval: num(ka['interval']) },
     events: arr(o['events']).map(parseEvent),
+  };
+  // optional block — only attach when the backend sends it at all
+  if (o['temp_guard'] !== undefined && o['temp_guard'] !== null) {
+    s.temp_guard = parseTempGuard(o['temp_guard']);
+  }
+  return s;
+}
+
+function parseTempGuard(raw: unknown): TempGuard {
+  const o = obj(raw);
+  const numOr = (v: unknown): number | null => {
+    const n = num(v, NaN);
+    return Number.isFinite(n) ? n : null;
+  };
+  const maxTemp = numOr(o['max_temp']);
+  const checkedAt = numOr(o['checked_at']);
+  const err = o['last_error'];
+  const errStr = typeof err === 'string' && err !== '' ? err : null;
+  const configEnabled = bool(o['config_enabled']);
+  const userEnabled = bool(o['user_enabled']);
+  return {
+    config_enabled: configEnabled,
+    user_enabled: userEnabled,
+    // trust the server's "enabled" when present, else derive it
+    enabled: o['enabled'] !== undefined ? bool(o['enabled'], configEnabled && userEnabled) : configEnabled && userEnabled,
+    fail_open: bool(o['fail_open']),
+    max_temp: maxTemp,
+    checked_at: checkedAt,
+    last_error: errStr,
   };
 }
 
@@ -192,4 +226,10 @@ export async function pause(): Promise<ToggleResult> {
 export async function resume(): Promise<ToggleResult> {
   const o = obj(await postJson('/resume'));
   return { ok: bool(o['ok'], true), paused: bool(o['paused'], false) };
+}
+
+/** POST /tempguard — flips user_enabled. Returns the new effective value. */
+export async function setTempGuard(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
+  const o = obj(await postJson('/tempguard', { enabled }));
+  return { ok: bool(o['ok'], true), enabled: bool(o['enabled'], enabled) };
 }

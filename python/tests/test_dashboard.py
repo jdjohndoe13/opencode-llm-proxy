@@ -361,3 +361,168 @@ def test_history_endpoint(tmp_path):
         finally:
             await proxy.close(); await backend.close()
     asyncio.run(main())
+
+
+# ------------------------------------------------------- temperature guard
+
+TEMP_ENV = {
+    "TEMP_CHECK_ENABLED": "1",
+    "TEMP_CHECK_STALL_ABOVE": "74",
+    "TEMP_CHECK_RESUME_BELOW": "60",
+    "TEMP_CHECK_POLL_INTERVAL": "0.1",
+    "TEMP_CHECK_CACHE_TTL": "0.05",
+    "TEMP_CHECK_HTTP_TIMEOUT": "500",
+}
+
+
+async def _start_temp(tmp_path, temps=None, over=None):
+    """Proxy + LLM backend + a mock temperature endpoint. temps=None keeps
+    the endpoint unreachable (dead port)."""
+    calls = {"n": 0}
+
+    async def chat(request):
+        calls["n"] += 1
+        return web.json_response(CHAT)
+
+    backend_app = web.Application()
+    backend_app.router.add_post("/v1/chat/completions", chat)
+    backend = TestServer(backend_app)
+    await backend.start_server()
+
+    state = {"temps": temps}
+
+    async def temperature(request):
+        if state["temps"] is None:
+            return web.Response(status=500)
+        return web.json_response(state["temps"])
+
+    temp_app = web.Application()
+    temp_app.router.add_get("/temperatures", temperature)
+    temp = TestServer(temp_app)
+    await temp.start_server()
+
+    env = dict(TEMP_ENV)
+    env["TEMP_CHECK_ENDPOINT"] = f"http://127.0.0.1:{temp.port}/temperatures"
+    env["TEMP_CHECK_STALL_LOG"] = str(tmp_path / "stall.log")
+    env.update(over or {})
+    cfg = _cfg(tmp_path, f"127.0.0.1:{backend.port}", **env)
+    proxy = TestClient(TestServer(create_app(cfg)))
+    await proxy.start_server()
+    return backend, proxy, temp, state, calls
+
+
+def test_temp_fail_open_forwards_when_endpoint_down(tmp_path):
+    """Endpoint down + TEMP_CHECK_FAIL_OPEN=1: the request is forwarded
+    instead of being stalled."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps=None, over={"TEMP_CHECK_FAIL_OPEN": "1"})
+        try:
+            async with await asyncio.wait_for(
+                    proxy.post("/v1/chat/completions",
+                               json={"model": "m", "stream": False}), 5) as r:
+                assert r.status == 200
+            assert calls["n"] == 1
+            st = await _state(proxy)
+            tg = st["temp_guard"]
+            assert tg["config_enabled"] is True and tg["fail_open"] is True
+            assert tg["last_error"] is not None
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_fail_closed_stalls_until_dashboard_disable(tmp_path):
+    """Endpoint down, default fail-closed: the request stalls (no reply)
+    and is released when the guard is switched off via the dashboard."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps=None)
+        try:
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 1.5)
+                assert False, "fail-closed must stall the request"
+            except asyncio.TimeoutError:
+                pass
+            assert calls["n"] == 0
+            st = await _state(proxy)
+            assert st["temp_guard"]["enabled"] is True
+            assert st["temp_guard"]["last_error"] is not None
+
+            # Toggle the guard off at runtime.
+            async with proxy.post("/api/dashboard/tempguard",
+                                  json={"enabled": False}) as r:
+                assert r.status == 200
+                assert await r.json() == {"ok": True, "enabled": False}
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+                assert (await r.json())["object"] == "chat.completion"
+            assert calls["n"] == 1
+
+            st = await _state(proxy)
+            assert st["temp_guard"]["enabled"] is False
+            assert st["temp_guard"]["user_enabled"] is False
+            assert st["temp_guard"]["config_enabled"] is True
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_guard_stalls_hot_and_releases_when_cool(tmp_path):
+    """Guard on + endpoint up: hot GPU stalls, cooling down releases, and
+    re-enabling via the dashboard is reported in state."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps={"gpu_0": 80})
+        try:
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 1.0)
+                assert False, "hot GPU must stall the request"
+            except asyncio.TimeoutError:
+                pass
+            assert calls["n"] == 0
+            st = await _state(proxy)
+            assert st["temp_guard"]["max_temp"] == 80
+
+            state["temps"] = {"gpu_0": 40}  # GPU cooled
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+            assert calls["n"] == 1
+
+            # Re-enable endpoint round-trip (already on -> stays on).
+            async with proxy.post("/api/dashboard/tempguard",
+                                  json={"enabled": True}) as r:
+                assert await r.json() == {"ok": True, "enabled": True}
+            # Malformed body -> 400.
+            async with proxy.post("/api/dashboard/tempguard",
+                                  json={"nope": 1}) as r:
+                assert r.status == 400
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_state_when_guard_disabled_globally(tmp_path):
+    """TEMP_CHECK_ENABLED=0: state reports the guard inactive regardless
+    of the runtime switch."""
+    async def main():
+        backend, proxy, _ = await _start(tmp_path)
+        try:
+            st = await _state(proxy)
+            tg = st["temp_guard"]
+            assert tg["enabled"] is False and tg["config_enabled"] is False
+            assert tg["user_enabled"] is True
+            async with proxy.post("/api/dashboard/tempguard",
+                                  json={"enabled": False}) as r:
+                assert r.status == 200
+            st = await _state(proxy)
+            assert st["temp_guard"]["user_enabled"] is False
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())

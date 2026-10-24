@@ -29,6 +29,11 @@ services:
       # GPU temperature guard (cool-down); "1"/"true" arms it, then all
       # other TEMP_CHECK_* variables become required.
       TEMP_CHECK_ENABLED: ${TEMP_CHECK_ENABLED:-0}
+      # When the monitor endpoint is unreachable: "1"/"true" forwards the
+      # request as if the temperatures were OK; the default keeps the
+      # conservative stall (requests wait for the monitor to come back).
+      # A runtime toggle is also available on the dashboard.
+      TEMP_CHECK_FAIL_OPEN: ${TEMP_CHECK_FAIL_OPEN:-0}
       TEMP_CHECK_ENDPOINT: ${TEMP_CHECK_ENDPOINT:-}
       TEMP_CHECK_STALL_ABOVE: ${TEMP_CHECK_STALL_ABOVE:-}
       TEMP_CHECK_RESUME_BELOW: ${TEMP_CHECK_RESUME_BELOW:-}

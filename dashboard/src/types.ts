@@ -26,6 +26,27 @@ export interface KeepaliveConfig {
   interval: number;
 }
 
+/**
+ * GPU temperature guard (secondary runtime control).
+ * enabled = config_enabled AND user_enabled (effective state).
+ */
+export interface TempGuard {
+  /** effective: config_enabled && user_enabled */
+  enabled: boolean;
+  /** TEMP_CHECK_ENABLED env — false means the guard is off entirely */
+  config_enabled: boolean;
+  /** runtime switch, toggled via POST /tempguard */
+  user_enabled: boolean;
+  /** TEMP_CHECK_FAIL_OPEN env */
+  fail_open: boolean;
+  /** last observed temperature snapshot, null = never fetched */
+  max_temp: number | null;
+  /** unix seconds of the last temperature check, null = never */
+  checked_at: number | null;
+  /** last monitor failure message, null = healthy */
+  last_error: string | null;
+}
+
 export interface ProxyEvent {
   /** unix seconds (float) */
   ts: number;
@@ -43,6 +64,8 @@ export interface DashboardState {
   keepalive: KeepaliveConfig;
   /** newest first */
   events: ProxyEvent[];
+  /** present only when the backend implements the guard */
+  temp_guard?: TempGuard;
 }
 
 export interface HistoryItem {

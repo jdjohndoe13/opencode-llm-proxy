@@ -162,6 +162,7 @@ async def state(request: web.Request) -> web.Response:
             "interval": cfg.keepalive_interval,
         },
         "events": gate.events(),
+        "temp_guard": request.app["temp_guard"].status(),
     })
 
 
@@ -187,6 +188,24 @@ async def history(request: web.Request) -> web.Response:
 
 async def healthz(request: web.Request) -> web.Response:
     return _json({"ok": True, "uptime_s": request.app["pause_gate"].uptime_s()})
+
+
+async def tempguard(request: web.Request) -> web.Response:
+    """POST /api/dashboard/tempguard  {"enabled": true|false}.
+
+    Runtime on/off switch for the GPU temperature guard (in-memory, resets
+    to on at restart). Without TEMP_CHECK_ENABLED the guard is inactive
+    regardless of this switch; the state endpoint reports both bits."""
+    guard = request.app["temp_guard"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return _json({"ok": False, "error": "expected {\"enabled\": true|false}"},
+                     status=400)
+    guard.set_user_enabled(body["enabled"])
+    return _json({"ok": True, "enabled": guard.user_enabled})
 
 
 # ---------------------------------------------------------------- static UI
@@ -262,6 +281,7 @@ def register(app: web.Application) -> None:
     r.add_route("*", "/api/dashboard/pause", _api(pause))
     r.add_route("*", "/api/dashboard/resume", _api(resume))
     r.add_route("*", "/api/dashboard/history", _api(history))
+    r.add_route("*", "/api/dashboard/tempguard", _api(tempguard))
     r.add_route("*", "/api/dashboard/healthz", _api(healthz))
     r.add_route("*", "/api/dashboard", _preflight)
     r.add_route("*", "/api/dashboard/{tail:.*}", _preflight)

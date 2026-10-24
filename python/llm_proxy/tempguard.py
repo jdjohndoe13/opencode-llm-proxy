@@ -22,6 +22,32 @@ class TempGuard:
         self._lock = asyncio.Lock()
         self._max_temp: float | None = None
         self._checked_at: float = 0.0
+        # Runtime on/off switch (dashboard), in-memory, default on. The
+        # guard is active only when both the config AND this switch are on,
+        # so a restart always re-arms it (fail-closed on restart).
+        self.user_enabled: bool = True
+        self.last_error: str | None = None
+
+    @property
+    def effective_enabled(self) -> bool:
+        return self.cfg.temp_checks_enabled and self.user_enabled
+
+    def set_user_enabled(self, enabled: bool) -> None:
+        self.user_enabled = bool(enabled)
+        log.info("temperature guard %s via dashboard",
+                 "enabled" if self.user_enabled else "disabled")
+
+    def status(self) -> dict:
+        """Snapshot for the dashboard state endpoint."""
+        return {
+            "enabled": self.effective_enabled,
+            "config_enabled": self.cfg.temp_checks_enabled,
+            "user_enabled": self.user_enabled,
+            "fail_open": self.cfg.temp_check_fail_open,
+            "max_temp": self._max_temp,
+            "checked_at": self._checked_at or None,
+            "last_error": self.last_error,
+        }
 
     def _read_cache(self) -> float | None:
         if self._max_temp is None:
@@ -45,24 +71,28 @@ class TempGuard:
                 url, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
                 if resp.status != 200:
+                    self.last_error = f"endpoint returned status {resp.status}"
                     log.error("temperature endpoint returned status %s", resp.status)
                     return None
                 body = await resp.text()
         except Exception as err:
+            self.last_error = f"connect failed: {err}"
             log.error("temperature endpoint connect failed: %s", err)
             return None
         try:
             obj = json.loads(body)
         except (ValueError, TypeError):
-            log.error("temperature endpoint returned invalid JSON")
-            return None
+            obj = None
         if not isinstance(obj, dict):
+            self.last_error = "endpoint returned invalid JSON"
             log.error("temperature endpoint returned invalid JSON")
             return None
         temps = [float(v) for v in obj.values() if isinstance(v, (int, float))]
         if not temps:
+            self.last_error = "endpoint returned no numeric values"
             log.error("temperature endpoint returned no numeric values")
             return None
+        self.last_error = None
         return temps
 
     async def wait_for_cool_down(self, ctx: dict, on_wait=None) -> bool:
@@ -72,10 +102,14 @@ class TempGuard:
         _stall_end, _aborted). on_wait is awaited periodically so streaming
         clients keep receiving keep-alive chunks during the stall."""
         cfg = self.cfg
-        if not cfg.temp_checks_enabled:
-            return True
         stalled = False
         while True:
+            # Re-checked every tick: the dashboard toggle (or a config
+            # reload) releases requests that are ALREADY stalled.
+            if not self.effective_enabled:
+                if stalled and ctx.get("_stall_start") and not ctx.get("_stall_end"):
+                    ctx["_stall_end"] = time.time()
+                return True
             if ctx.get("_aborted"):
                 return False
 
@@ -86,6 +120,11 @@ class TempGuard:
                     if max_temp is None:
                         temps = await self.fetch_temperatures()
                         if temps is None:
+                            if cfg.temp_check_fail_open:
+                                log.warning("temperature check failed; "
+                                            "TEMP_CHECK_FAIL_OPEN is on, "
+                                            "forwarding the request anyway")
+                                return True
                             log.error("temperature check failed; conservatively "
                                       "stalling request")
                             ctx.setdefault("_stall_start", time.time())

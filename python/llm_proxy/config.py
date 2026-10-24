@@ -44,6 +44,7 @@ class Config:
     upstream_timeout: float = 0.0
     upstream_retries: int = 0
     temp_checks_enabled: bool = False
+    temp_check_fail_open: bool = False
     temp_check_endpoint: str = ""
     temp_check_stall_above: float = 0.0
     temp_check_resume_below: float = 0.0
@@ -109,6 +110,10 @@ def load(env: dict[str, str] | None = None) -> Config:
     cfg.upstream_retries = int(retries)
 
     cfg.temp_checks_enabled = _enabled(e.get("TEMP_CHECK_ENABLED"))
+    # When the monitor is unreachable: fail open (forward as if the
+    # temperatures were OK) instead of the conservative stall. Only
+    # meaningful while TEMP_CHECK_ENABLED is on; parsed unconditionally.
+    cfg.temp_check_fail_open = _enabled(e.get("TEMP_CHECK_FAIL_OPEN"))
     if cfg.temp_checks_enabled:
         cfg.temp_check_endpoint = _require_var(
             "TEMP_CHECK_ENDPOINT", e.get("TEMP_CHECK_ENDPOINT"))

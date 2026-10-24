@@ -10,7 +10,7 @@
  * known state, flags it stale, and shows a "proxy unreachable" banner.
  */
 import './styles.css';
-import { ApiError, fetchHistory, fetchState, pause, resume } from './api';
+import { ApiError, fetchHistory, fetchState, pause, resume, setTempGuard } from './api';
 import {
   fmtAgo,
   fmtClock,
@@ -36,6 +36,7 @@ let ageOffsetMs = 0; // ms since last /state → interpolate ages between polls
 
 let confirmTimer = 0;
 let actionPending = false;
+let guardPending = false;
 
 let histPage = 1;
 let histSize = 20;
@@ -92,6 +93,22 @@ app.innerHTML = `
     <button class="pause-btn" id="pause-btn" type="button" disabled>
       <span id="btn-label">···</span>
     </button>
+  </section>
+
+  <section class="tg-strip" id="tg-strip" hidden>
+    <span class="tg-title">Temperature guard</span>
+    <span class="tg-state" id="tg-state"><span class="tg-dot"></span><span id="tg-state-text">—</span></span>
+    <button class="tg-switch" id="tg-switch" type="button"
+            title="Toggle the GPU temperature guard. Off (or fail-open) forwards requests even when the monitor is down; the guard re-arms on proxy restart."></button>
+    <span class="tg-facts">
+      <span>max <b id="tg-temp">—</b></span>
+      <span>checked <b id="tg-checked">—</b></span>
+    </span>
+    <span class="tg-hint">off = forward even when monitor is down · re-arms on restart</span>
+    <span class="tg-error" id="tg-error">
+      <span class="tg-tag" id="tg-tag">—</span>
+      <span class="tg-msg" id="tg-msg"></span>
+    </span>
   </section>
 
   <section class="panel">
@@ -192,6 +209,15 @@ const pageNext = $<HTMLButtonElement>('#page-next');
 const fUptime = $<HTMLSpanElement>('#f-uptime');
 const fKeepalive = $<HTMLSpanElement>('#f-keepalive');
 const fEvents = $<HTMLSpanElement>('#f-events');
+const tgStrip = $<HTMLElement>('#tg-strip');
+const tgState = $<HTMLSpanElement>('#tg-state');
+const tgStateText = $<HTMLSpanElement>('#tg-state-text');
+const tgSwitch = $<HTMLButtonElement>('#tg-switch');
+const tgTemp = $<HTMLSpanElement>('#tg-temp');
+const tgChecked = $<HTMLSpanElement>('#tg-checked');
+const tgError = $<HTMLElement>('#tg-error');
+const tgTag = $<HTMLElement>('#tg-tag');
+const tgMsg = $<HTMLElement>('#tg-msg');
 const favIcon = $opt<HTMLLinkElement>('link[rel="icon"]');
 
 /* ------------------------------------------------------------- rendering */
@@ -352,6 +378,50 @@ function renderButton(): void {
   }
 }
 
+function renderTempGuard(): void {
+  const g = state?.temp_guard;
+  if (!g) {
+    // backend doesn't expose the guard — hide the whole strip
+    tgStrip.hidden = true;
+    return;
+  }
+  tgStrip.hidden = false;
+
+  // effective state pill: ON / OFF / INACTIVE (config off)
+  const configOff = !g.config_enabled;
+  tgState.className = configOff ? 'tg-state inactive' : g.enabled ? 'tg-state on' : 'tg-state off';
+  tgStateText.textContent = configOff ? 'INACTIVE' : g.enabled ? 'ON' : 'OFF';
+
+  // switch reflects user_enabled; disabled when config disables the guard
+  const on = g.user_enabled && !configOff;
+  tgSwitch.classList.toggle('on', on);
+  tgSwitch.disabled = configOff || conn === 'down' || guardPending;
+  tgSwitch.classList.toggle('busy', guardPending);
+  tgSwitch.title = configOff
+    ? 'Disabled by config (TEMP_CHECK_ENABLED=false) — the guard is off entirely.'
+    : 'Toggle the GPU temperature guard. Off (or fail-open) forwards requests even when the monitor is down; the guard re-arms on proxy restart.';
+
+  // live facts
+  tgTemp.textContent = g.max_temp === null ? '—' : `${g.max_temp.toFixed(0)}°C`;
+  tgChecked.textContent =
+    g.checked_at === null ? 'never' : fmtAgo(g.checked_at, Date.now() / 1000);
+
+  // error / failure-open / stalling states
+  const hasErr = g.last_error !== null;
+  if (hasErr) {
+    if (g.fail_open) {
+      tgError.className = 'tg-error warn show';
+      tgTag.textContent = 'FAILING OPEN';
+    } else {
+      tgError.className = 'tg-error danger show';
+      tgTag.textContent = 'STALLING REQUESTS';
+    }
+    tgMsg.textContent = g.last_error;
+  } else {
+    tgError.className = 'tg-error';
+  }
+}
+
 function renderHistory(): void {
   if (historyError) {
     histBody.replaceChildren();
@@ -484,6 +554,7 @@ async function pollState(): Promise<void> {
   renderHero();
   renderInflight();
   renderButton();
+  renderTempGuard();
   renderFooter();
   renderSync();
 }
@@ -557,6 +628,43 @@ pauseBtn.addEventListener('click', () => {
     })
     .finally(() => {
       actionPending = false;
+      void pollState();
+    });
+});
+
+tgSwitch.addEventListener('click', () => {
+  const s = state;
+  const g = s?.temp_guard;
+  if (!s || !g || !g.config_enabled || guardPending || conn === 'down') return;
+  const target = !g.user_enabled;
+  // optimistic flip — the next /state poll re-checks against the server.
+  // apply() merges into the CURRENT state so a /state poll landing while
+  // the POST is in flight is not clobbered.
+  guardPending = true;
+  const apply = (enabled: boolean): void => {
+    const cur = state;
+    if (!cur?.temp_guard) return;
+    const g0 = cur.temp_guard;
+    state = { ...cur, temp_guard: { ...g0, user_enabled: enabled, enabled: g0.config_enabled && enabled } };
+  };
+  apply(target);
+  renderTempGuard();
+  setTempGuard(target)
+    .then((res) => {
+      if (!res.ok || res.enabled !== target) apply(!target); // server disagreed
+    })
+    .catch((err) => {
+      if (err instanceof ApiError && err.status === 400) {
+        // malformed body / unknown endpoint — revert the flip, keep the console alive
+        apply(!target);
+      } else {
+        setConnDown(err);
+        apply(!target);
+      }
+    })
+    .finally(() => {
+      guardPending = false;
+      renderTempGuard();
       void pollState();
     });
 });

@@ -362,6 +362,195 @@ body::before {
   50% { opacity: 0.55; }
 }
 
+/* ---------- temperature guard strip (secondary control) ---------- */
+
+.tg-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+  padding: 8px 14px;
+  font-size: 11.5px;
+  flex-wrap: wrap;
+}
+
+.tg-strip[hidden] {
+  display: none;
+}
+
+.tg-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  flex: none;
+}
+
+/* pill: ON / OFF / INACTIVE */
+.tg-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  border-radius: 99px;
+  padding: 2px 10px;
+  border: 1px solid var(--line);
+  color: var(--ink-faint);
+  flex: none;
+}
+
+.tg-state .tg-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.tg-state.on {
+  color: var(--green);
+  border-color: rgba(53, 217, 140, 0.45);
+  background: rgba(53, 217, 140, 0.07);
+}
+
+.tg-state.off {
+  color: var(--ink-dim);
+  border-color: var(--line);
+}
+
+.tg-state.inactive {
+  color: var(--ink-faint);
+  border-style: dashed;
+}
+
+/* the switch */
+.tg-switch {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 99px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  cursor: pointer;
+  flex: none;
+  padding: 0;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+}
+
+.tg-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ink-dim);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.tg-switch.on {
+  background: var(--green-deep);
+  border-color: var(--green);
+}
+
+.tg-switch.on::after {
+  transform: translateX(16px);
+  background: var(--green);
+}
+
+.tg-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.tg-switch.busy {
+  animation: busy 0.8s ease-in-out infinite;
+}
+
+.tg-switch:hover:not(:disabled) {
+  border-color: var(--green);
+}
+
+/* live facts */
+.tg-facts {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  color: var(--ink-faint);
+  flex-wrap: wrap;
+}
+
+.tg-facts b {
+  color: var(--ink-dim);
+  font-weight: 600;
+}
+
+.tg-hint {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  max-width: 46ch;
+  text-align: right;
+}
+
+/* error states — the thing the user watches for */
+.tg-error {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border-top: 1px dashed var(--line);
+  padding-top: 7px;
+  margin-top: 1px;
+}
+
+.tg-error.show {
+  display: flex;
+}
+
+.tg-error .tg-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  border-radius: 3px;
+  padding: 1px 7px;
+  border: 1px solid;
+  flex: none;
+}
+
+.tg-error.warn .tg-tag {
+  color: var(--amber);
+  border-color: rgba(255, 180, 84, 0.5);
+  background: rgba(255, 180, 84, 0.08);
+}
+
+.tg-error.danger .tg-tag {
+  color: var(--red);
+  border-color: rgba(255, 93, 85, 0.55);
+  background: var(--red-glow);
+  animation: blink 1.2s steps(2, start) infinite;
+}
+
+.tg-error .tg-msg {
+  color: var(--ink-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tg-error.warn .tg-msg {
+  color: var(--amber);
+}
+
+.tg-error.danger .tg-msg {
+  color: var(--red);
+}
+
 /* ---------- panels ---------- */
 
 .panel {
