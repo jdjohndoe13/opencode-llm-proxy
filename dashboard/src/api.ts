@@ -58,6 +58,11 @@ function obj(v: unknown): Record<string, unknown> {
   return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {};
 }
 
+function numOr(v: unknown): number | null {
+  const n = num(v, NaN);
+  return Number.isFinite(n) ? n : null;
+}
+
 /* ---------- fetch helpers ---------- */
 
 async function getJson(path: string, timeoutMs = 6000): Promise<unknown> {
@@ -162,7 +167,7 @@ function parseTempGuard(raw: unknown): TempGuard {
   const errStr = typeof err === 'string' && err !== '' ? err : null;
   const configEnabled = bool(o['config_enabled']);
   const userEnabled = bool(o['user_enabled']);
-  return {
+  const g: TempGuard = {
     config_enabled: configEnabled,
     user_enabled: userEnabled,
     // trust the server's "enabled" when present, else derive it
@@ -172,6 +177,20 @@ function parseTempGuard(raw: unknown): TempGuard {
     checked_at: checkedAt,
     last_error: errStr,
   };
+  // optional thresholds — only present when the guard is armed by config
+  const opt = (key: string): number | undefined => {
+    const n = numOr(o[key]);
+    return n === null ? undefined : n;
+  };
+  const stall = opt('stall_above');
+  const resume = opt('resume_below');
+  if (stall !== undefined) g.stall_above = stall;
+  if (resume !== undefined) g.resume_below = resume;
+  const dStall = opt('default_stall_above');
+  const dResume = opt('default_resume_below');
+  if (dStall !== undefined) g.default_stall_above = dStall;
+  if (dResume !== undefined) g.default_resume_below = dResume;
+  return g;
 }
 
 function parseHistoryItem(raw: unknown) {
@@ -232,4 +251,35 @@ export async function resume(): Promise<ToggleResult> {
 export async function setTempGuard(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
   const o = obj(await postJson('/tempguard', { enabled }));
   return { ok: bool(o['ok'], true), enabled: bool(o['enabled'], enabled) };
+}
+
+/**
+ * POST /tempguard/thresholds — edits the live hysteresis pair (in-memory,
+ * a restart re-reads .env). Pass both numbers, or `reset` to go back to
+ * the .env values. A rejected pair comes back as HTTP 400 with `error`.
+ */
+export interface ThresholdResult {
+  ok: boolean;
+  stall_above: number | null;
+  resume_below: number | null;
+  error: string | null;
+}
+
+export async function setTempThresholds(
+  stallAbove: number,
+  resumeBelow: number,
+): Promise<ThresholdResult>;
+export async function setTempThresholds(reset: { reset: true }): Promise<ThresholdResult>;
+export async function setTempThresholds(
+  a: number | { reset: true },
+  b?: number,
+): Promise<ThresholdResult> {
+  const body = typeof a === 'number' ? { stall_above: a, resume_below: b } : a;
+  const o = obj(await postJson('/tempguard/thresholds', body));
+  return {
+    ok: bool(o['ok'], true),
+    stall_above: numOr(o['stall_above']),
+    resume_below: numOr(o['resume_below']),
+    error: typeof o['error'] === 'string' ? o['error'] : null,
+  };
 }

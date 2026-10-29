@@ -3,6 +3,7 @@ test_server_e2e.py: ephemeral ports only, the real proxy is never touched).
 """
 import asyncio
 import json
+import time
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -526,3 +527,180 @@ def test_temp_state_when_guard_disabled_globally(tmp_path):
         finally:
             await proxy.close(); await backend.close()
     asyncio.run(main())
+
+
+# ------------------------------------------------- runtime threshold editing
+
+async def _thresholds(proxy, body, expect=200):
+    async with proxy.post("/api/dashboard/tempguard/thresholds",
+                          json=body) as r:
+        assert r.status == expect, f"{body} -> HTTP {r.status}"
+        assert r.headers.get("Access-Control-Allow-Origin") == "*"
+        return await r.json()
+
+
+def test_temp_thresholds_edit_and_reset(tmp_path):
+    """The live hysteresis pair is editable at runtime, reported in state
+    (only while the guard is armed by config), and resettable to .env."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps={"gpu_0": 50})
+        try:
+            tg = (await _state(proxy))["temp_guard"]
+            assert (tg["stall_above"], tg["resume_below"]) == (74.0, 60.0)
+            assert (tg["default_stall_above"], tg["default_resume_below"]) \
+                == (74.0, 60.0)
+
+            out = await _thresholds(proxy, {"stall_above": 50,
+                                            "resume_below": 30})
+            assert out == {"ok": True, "stall_above": 50.0,
+                           "resume_below": 30.0}
+            tg = (await _state(proxy))["temp_guard"]
+            assert (tg["stall_above"], tg["resume_below"]) == (50.0, 30.0)
+            # the .env defaults survive an edit for the reset button
+            assert (tg["default_stall_above"], tg["default_resume_below"]) \
+                == (74.0, 60.0)
+
+            # Partial edit: the omitted key keeps its live value.
+            out = await _thresholds(proxy, {"resume_below": 20})
+            assert (out["stall_above"], out["resume_below"]) == (50.0, 20.0)
+
+            out = await _thresholds(proxy, {"reset": True})
+            assert (out["stall_above"], out["resume_below"]) == (74.0, 60.0)
+            tg = (await _state(proxy))["temp_guard"]
+            assert (tg["stall_above"], tg["resume_below"]) == (74.0, 60.0)
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_thresholds_change_live_behaviour(tmp_path):
+    """A lowered threshold stalls a temperature the .env pair let
+    through, and the stalled request is released by further cooling —
+    the edit is not merely cosmetic."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps={"gpu_0": 60})
+        try:
+            # 60°C is below the .env stall_above=74: forwarded at once.
+            async with await asyncio.wait_for(
+                    proxy.post("/v1/chat/completions",
+                               json={"model": "m", "stream": False}), 5) as r:
+                assert r.status == 200
+            assert calls["n"] == 1
+
+            await _thresholds(proxy, {"stall_above": 50, "resume_below": 30})
+
+            # The same 60°C now stalls: no reply, no further upstream call.
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 1.5)
+                assert False, "60°C must stall once stall_above is 50"
+            except asyncio.TimeoutError:
+                pass
+            assert calls["n"] == 1, "stalled request must not reach the backend"
+
+            # 40°C is above the new resume_below=30: still held.
+            state["temps"] = {"gpu_0": 40}
+            await asyncio.sleep(0.6)
+            assert calls["n"] == 1
+
+            # 20°C releases it.
+            state["temps"] = {"gpu_0": 20}
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+            assert calls["n"] == 2
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_thresholds_validation_keeps_live_values(tmp_path):
+    """A rejected pair comes back as 400 with a reason and leaves the
+    live thresholds untouched."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps={"gpu_0": 50})
+        try:
+            bad = [
+                ({"stall_above": 30, "resume_below": 60}, "lower"),   # inverted
+                ({"stall_above": 60, "resume_below": 60}, "lower"),   # equal
+                ({"stall_above": 9999}, "between"),                   # out of range
+                ({"resume_below": -51}, "between"),                   # out of range
+                ({"stall_above": "hot"}, "number"),                   # not a number
+                ({"stall_above": 70, "resume_below": 60, "x": 1}, "unexpected"),
+                ({}, "stall_above"),                                  # nothing to do
+            ]
+            for body, phrase in bad:
+                out = await _thresholds(proxy, body, expect=400)
+                assert out["ok"] is False
+                assert phrase in out["error"], f"{body} -> {out['error']}"
+            tg = (await _state(proxy))["temp_guard"]
+            assert (tg["stall_above"], tg["resume_below"]) == (74.0, 60.0)
+
+            # Boundary values are accepted (they are sane, if silly).
+            await _thresholds(proxy, {"stall_above": 250, "resume_below": -50})
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_temp_thresholds_require_config_and_reach_state(tmp_path):
+    """With the guard disarmed by config there is nothing to tune (400),
+    and state omits the threshold keys entirely."""
+    async def main():
+        backend, proxy, _ = await _start(tmp_path)
+        try:
+            tg = (await _state(proxy))["temp_guard"]
+            for key in ("stall_above", "resume_below",
+                        "default_stall_above", "default_resume_below"):
+                assert key not in tg
+            out = await _thresholds(proxy, {"stall_above": 70}, expect=400)
+            assert out["ok"] is False
+            assert "disabled by config" in out["error"]
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_temp_checked_at_is_wall_clock(tmp_path):
+    """state.checked_at is wall-clock, not the monotonic clock the cache
+    uses internally: a monotonic value would make the dashboard's
+    "checked N ago" age a nonsense countdown from container start."""
+    async def main():
+        backend, proxy, temp, state, calls = await _start_temp(
+            tmp_path, temps={"gpu_0": 48})
+        try:
+            # No snapshot fetched yet.
+            assert (await _state(proxy))["temp_guard"]["checked_at"] is None
+
+            # Any forwarded request fetches a snapshot.
+            async with await asyncio.wait_for(
+                    proxy.post("/v1/chat/completions",
+                               json={"model": "m", "stream": False}), 5) as r:
+                assert r.status == 200
+            before = time.time()
+            checked = (await _state(proxy))["temp_guard"]["checked_at"]
+            assert isinstance(checked, (int, float))
+            assert before - 10 <= checked <= time.time() + 10
+        finally:
+            await proxy.close(); await backend.close(); await temp.close()
+    asyncio.run(main())
+
+
+def test_validate_thresholds():
+    """Unit-level rules behind the endpoint's 400s."""
+    from llm_proxy.tempguard import validate_thresholds
+
+    assert validate_thresholds(74, 60) is None
+    assert validate_thresholds(250, -50) is None       # both boundaries
+    assert "lower" in validate_thresholds(60, 60)      # equal is not below
+    assert "lower" in validate_thresholds(30, 60)      # inverted
+    assert "between" in validate_thresholds(251, 60)
+    assert "between" in validate_thresholds(74, -51)
+    assert "finite" in validate_thresholds(float("nan"), 60)
+    assert "finite" in validate_thresholds(74, float("inf"))
+    assert "finite" in validate_thresholds("74", 60)   # str
+    assert "finite" in validate_thresholds(74, True)   # bool is not a number

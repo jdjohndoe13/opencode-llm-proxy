@@ -7,6 +7,8 @@ the backend):
   POST /api/dashboard/pause     pause the proxy (in-flight requests keep going)
   POST /api/dashboard/resume    resume the proxy
   GET  /api/dashboard/history   paginated stats.jsonl tail, newest first
+  POST /api/dashboard/tempguard             on/off for the temperature guard
+  POST /api/dashboard/tempguard/thresholds  edit the hysteresis pair
   GET  /api/dashboard/healthz   {ok:true} — lets the UI tell proxy vs backend
   GET  /dashboard               the built static UI (python/llm_proxy/static)
   GET  /dashboard/assets/...    static assets
@@ -208,6 +210,57 @@ async def tempguard(request: web.Request) -> web.Response:
     return _json({"ok": True, "enabled": guard.user_enabled})
 
 
+async def tempguard_thresholds(request: web.Request) -> web.Response:
+    """POST /api/dashboard/tempguard/thresholds
+    {"stall_above": 74, "resume_below": 60}   (either key may be omitted)
+    {"reset": true}                            (back to the .env values)
+
+    Runtime edit of the hysteresis pair — the same in-memory semantics as
+    the on/off switch, so a restart re-reads TEMP_CHECK_* from .env. The
+    pair is validated as a whole (see validate_thresholds) and a rejected
+    edit leaves the live values untouched. Requires TEMP_CHECK_ENABLED:
+    with the guard disarmed by config there is nothing to tune."""
+    guard = request.app["temp_guard"]
+    if not guard.cfg.temp_checks_enabled:
+        return _json({"ok": False,
+                      "error": "temperature guard is disabled by config"},
+                     status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return _json({"ok": False,
+                      "error": "expected {\"stall_above\": n, \"resume_below\": n}"
+                               " or {\"reset\": true}"},
+                     status=400)
+    if body.get("reset") is True:
+        guard.reset_thresholds()
+    else:
+        unknown = set(body) - {"stall_above", "resume_below"}
+        if unknown:
+            return _json({"ok": False,
+                          "error": f"unexpected keys: {', '.join(sorted(unknown))}"},
+                         status=400)
+        if not {"stall_above", "resume_below"} & set(body):
+            return _json({"ok": False,
+                          "error": "expected \"stall_above\" and/or \"resume_below\""},
+                         status=400)
+        for key in ("stall_above", "resume_below"):
+            if key in body and not isinstance(body[key], (int, float)):
+                return _json({"ok": False,
+                              "error": f"{key} must be a number"},
+                             status=400)
+        applied, err = guard.set_thresholds(
+            stall_above=body.get("stall_above"),
+            resume_below=body.get("resume_below"))
+        if not applied:
+            return _json({"ok": False, "error": err}, status=400)
+    return _json({"ok": True,
+                  "stall_above": guard.stall_above,
+                  "resume_below": guard.resume_below})
+
+
 # ---------------------------------------------------------------- static UI
 
 def _content_type(path: Path) -> str:
@@ -282,6 +335,8 @@ def register(app: web.Application) -> None:
     r.add_route("*", "/api/dashboard/resume", _api(resume))
     r.add_route("*", "/api/dashboard/history", _api(history))
     r.add_route("*", "/api/dashboard/tempguard", _api(tempguard))
+    r.add_route("*", "/api/dashboard/tempguard/thresholds",
+                _api(tempguard_thresholds))
     r.add_route("*", "/api/dashboard/healthz", _api(healthz))
     r.add_route("*", "/api/dashboard", _preflight)
     r.add_route("*", "/api/dashboard/{tail:.*}", _preflight)

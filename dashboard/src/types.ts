@@ -45,6 +45,16 @@ export interface TempGuard {
   checked_at: number | null;
   /** last monitor failure message, null = healthy */
   last_error: string | null;
+  /**
+   * Live hysteresis pair (stall above / resume below, °C). Present only
+   * when the guard is armed by config; editable via
+   * POST /tempguard/thresholds, so they can differ from the .env values.
+   */
+  stall_above?: number;
+  resume_below?: number;
+  /** the .env values the live pair would reset to */
+  default_stall_above?: number;
+  default_resume_below?: number;
 }
 
 export interface ProxyEvent {

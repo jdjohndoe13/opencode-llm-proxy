@@ -119,8 +119,8 @@ cp .env.example .env
 | `TEMP_CHECK_ENABLED` | `1` or `true` (case-insensitive) arms the GPU temperature guard; anything else (or unset) disables it and every other `TEMP_CHECK_*` variable is ignored. The dashboard can additionally switch the guard off at runtime (re-arms on restart) |
 | `TEMP_CHECK_FAIL_OPEN` | Python service only. When the monitor endpoint is unreachable: `1`/`true` forwards the request as if the temperatures were OK; `0` (default) keeps the conservative stall (requests wait until the monitor answers again) |
 | `TEMP_CHECK_ENDPOINT` | Full URL of a monitor returning a JSON object of GPU temperatures, e.g. `http://host.docker.internal:18082/temperatures` → `{"gpu_0":48,...}` |
-| `TEMP_CHECK_STALL_ABOVE` | Requests are stalled while any GPU temperature is above this value |
-| `TEMP_CHECK_RESUME_BELOW` | Stalled requests resume once every temperature is below this value (hysteresis) |
+| `TEMP_CHECK_STALL_ABOVE` | Requests are stalled while any GPU temperature is above this value. Editable at runtime from the dashboard (resets to this value on restart) |
+| `TEMP_CHECK_RESUME_BELOW` | Stalled requests resume once every temperature is below this value (hysteresis). Editable at runtime from the dashboard (resets to this value on restart) |
 | `TEMP_CHECK_POLL_INTERVAL` | Seconds between monitor polls (shared across all requests/workers) |
 | `TEMP_CHECK_CACHE_TTL` | Seconds a fetched temperature snapshot stays valid in the shared cache |
 | `TEMP_CHECK_HTTP_TIMEOUT` | Millisecond timeout for monitor HTTP calls |
@@ -307,6 +307,12 @@ POST /api/dashboard/resume             resume the proxy
 POST /api/dashboard/tempguard          {"enabled": true|false} — runtime switch
                                        for the GPU temperature guard (the
                                        guard re-arms on proxy restart)
+POST /api/dashboard/tempguard/thresholds  {"stall_above":n,"resume_below":n}
+                                       (either key alone is enough) or
+                                       {"reset":true} — live hysteresis pair,
+                                       also reset on proxy restart; 400 when
+                                       the pair is invalid or the guard is
+                                       disarmed by config
 GET  /api/dashboard/history?page=1&size=20   stats.jsonl tail, newest first
 GET  /api/dashboard/healthz            {ok:true} — proxy vs backend
 ```

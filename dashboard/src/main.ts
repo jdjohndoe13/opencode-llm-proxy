@@ -10,7 +10,7 @@
  * known state, flags it stale, and shows a "proxy unreachable" banner.
  */
 import './styles.css';
-import { ApiError, fetchHistory, fetchState, pause, resume, setTempGuard } from './api';
+import { ApiError, fetchHistory, fetchState, pause, resume, setTempGuard, setTempThresholds } from './api';
 import {
   fmtAgo,
   fmtClock,
@@ -37,6 +37,17 @@ let ageOffsetMs = 0; // ms since last /state → interpolate ages between polls
 let confirmTimer = 0;
 let actionPending = false;
 let guardPending = false;
+
+/* Threshold editor. `thrLive` is the pair the guard is applying right now
+ * (shown in the "now" readout, never edited by typing). `thrDirty` means
+ * the fields hold a value that has not been applied yet, which is what
+ * keeps a 2s /state poll from overwriting the user's typing. `thrPending`
+ * guards the in-flight POST and `thrError` holds a rejection message
+ * until the next successful sync or edit. */
+let thrPending = false;
+let thrError: string | null = null;
+let thrLive: { stall: number; resume: number } | null = null;
+let thrDirty = false;
 
 let histPage = 1;
 let histSize = 20;
@@ -104,7 +115,29 @@ app.innerHTML = `
       <span>max <b id="tg-temp">—</b></span>
       <span>checked <b id="tg-checked">—</b></span>
     </span>
-    <span class="tg-hint">off = forward even when monitor is down · re-arms on restart</span>
+    <span class="tg-thr" id="tg-thr" hidden>
+      <span class="tg-cur" id="tg-cur"
+            title="The thresholds the guard is applying right now">
+        now <b id="tg-cur-stall">—</b>
+        <span class="tg-sep">·</span>
+        <b id="tg-cur-resume">—</b>
+      </span>
+      <label for="tg-stall">stall&nbsp;&gt;</label>
+      <input id="tg-stall" type="number" step="1" min="-50" max="250"
+             inputmode="decimal" title="New stall threshold — applied when you press Apply" />
+      <span class="tg-unit">°C</span>
+      <label for="tg-resume">resume&nbsp;&lt;</label>
+      <input id="tg-resume" type="number" step="1" min="-50" max="250"
+             inputmode="decimal" title="New resume threshold — applied when you press Apply" />
+      <span class="tg-unit">°C</span>
+      <button class="tg-apply" id="tg-apply" type="button" disabled
+              title="Apply the thresholds in the fields">apply</button>
+      <button class="tg-reset" id="tg-reset" type="button" disabled
+              title="Restore the .env thresholds">reset</button>
+      <span class="tg-edited" id="tg-edited" hidden>edited</span>
+    </span>
+    <span class="tg-hint">off = forward even when monitor is down · switch and thresholds reset on restart</span>
+    <span class="tg-thr-err" id="tg-thr-err"></span>
     <span class="tg-error" id="tg-error">
       <span class="tg-tag" id="tg-tag">—</span>
       <span class="tg-msg" id="tg-msg"></span>
@@ -218,6 +251,16 @@ const tgChecked = $<HTMLSpanElement>('#tg-checked');
 const tgError = $<HTMLElement>('#tg-error');
 const tgTag = $<HTMLElement>('#tg-tag');
 const tgMsg = $<HTMLElement>('#tg-msg');
+const tgThr = $<HTMLElement>('#tg-thr');
+const tgCur = $<HTMLElement>('#tg-cur');
+const tgCurStall = $<HTMLElement>('#tg-cur-stall');
+const tgCurResume = $<HTMLElement>('#tg-cur-resume');
+const tgStall = $<HTMLInputElement>('#tg-stall');
+const tgResume = $<HTMLInputElement>('#tg-resume');
+const tgApply = $<HTMLButtonElement>('#tg-apply');
+const tgReset = $<HTMLButtonElement>('#tg-reset');
+const tgEdited = $<HTMLElement>('#tg-edited');
+const tgThrErr = $<HTMLElement>('#tg-thr-err');
 const favIcon = $opt<HTMLLinkElement>('link[rel="icon"]');
 
 /* ------------------------------------------------------------- rendering */
@@ -238,6 +281,8 @@ function stateBadgeClass(stateName: string): string {
       return 'badge st-upstream';
     case 'paused':
       return 'badge st-paused';
+    case 'stalled':
+      return 'badge st-stalled';
     default:
       return 'badge st-other';
   }
@@ -378,6 +423,87 @@ function renderButton(): void {
   }
 }
 
+/** Live "checked" age: the snapshot timestamp is absolute, so the 1s tick
+ * can advance it between polls instead of leaving it frozen for 2s. */
+function tickChecked(): void {
+  const g = state?.temp_guard;
+  if (!g) return;
+  tgChecked.textContent =
+    g.checked_at === null ? 'never' : fmtAgo(g.checked_at, Date.now() / 1000);
+}
+
+/** Threshold values the user has typed, or null when the pair is unusable. */
+function draftThresholds(): { stall: number; resume: number } | null {
+  const stall = Number(tgStall.value);
+  const resume = Number(tgResume.value);
+  if (tgStall.value.trim() === '' || tgResume.value.trim() === '') return null;
+  if (!Number.isFinite(stall) || !Number.isFinite(resume)) return null;
+  return { stall, resume };
+}
+
+function renderThresholds(): void {
+  const g = state?.temp_guard;
+  const have =
+    g !== undefined &&
+    g.config_enabled &&
+    g.stall_above !== undefined &&
+    g.resume_below !== undefined;
+  tgThr.hidden = !have;
+  if (!have || !g) {
+    thrLive = null;
+    return;
+  }
+  const live = { stall: g.stall_above as number, resume: g.resume_below as number };
+  const changed = thrLive !== null && (thrLive.stall !== live.stall || thrLive.resume !== live.resume);
+  thrLive = live;
+
+  // The "now" readout is always the live pair — typing never touches it,
+  // so the active threshold stays visible while a new value is typed in.
+  tgCurStall.textContent = `>${live.stall}°C`;
+  tgCurResume.textContent = `<${live.resume}°C`;
+  if (g.default_stall_above !== undefined) {
+    tgCur.title =
+      `The thresholds the guard is applying right now ` +
+      `(.env: >${g.default_stall_above}°C · <${g.default_resume_below}°C)`;
+  }
+
+  // The fields are the user's draft: re-seed them from the live pair
+  // only while nothing has been typed (or right after a successful
+  // apply/reset), so a 2s poll can never overwrite typing.
+  if (!thrDirty) {
+    tgStall.value = String(live.stall);
+    tgResume.value = String(live.resume);
+  }
+
+  const draft = draftThresholds();
+  const differs =
+    draft !== null && (draft.stall !== live.stall || draft.resume !== live.resume);
+  const invalid = draft !== null && draft.resume >= draft.stall;
+
+  const atDefault =
+    g.default_stall_above === undefined ||
+    (live.stall === g.default_stall_above && live.resume === g.default_resume_below);
+  tgEdited.hidden = atDefault;
+  tgReset.disabled = atDefault || thrPending || conn === 'down';
+  tgApply.disabled = thrPending || conn === 'down' || !differs || invalid;
+  tgStall.disabled = thrPending || conn === 'down';
+  tgResume.disabled = thrPending || conn === 'down';
+
+  // Local validation first: the same rule the server enforces.
+  let msg = thrError;
+  if (msg === null && invalid) {
+    msg = `resume must be lower than stall (${draft.resume} < ${draft.stall})`;
+  }
+  const wasShown = tgThrErr.classList.contains('show');
+  tgThrErr.textContent = msg ?? '';
+  tgThrErr.classList.toggle('show', msg !== null);
+  if (msg !== null && !wasShown && !changed) {
+    tgThrErr.classList.add('flash');
+  } else if (msg === null) {
+    tgThrErr.classList.remove('flash');
+  }
+}
+
 function renderTempGuard(): void {
   const g = state?.temp_guard;
   if (!g) {
@@ -403,8 +529,17 @@ function renderTempGuard(): void {
 
   // live facts
   tgTemp.textContent = g.max_temp === null ? '—' : `${g.max_temp.toFixed(0)}°C`;
-  tgChecked.textContent =
-    g.checked_at === null ? 'never' : fmtAgo(g.checked_at, Date.now() / 1000);
+  // colour the reading against the stall threshold so the margin is visible
+  const hot =
+    g.max_temp !== null && g.stall_above !== undefined && g.max_temp >= g.stall_above;
+  const warm =
+    !hot &&
+    g.max_temp !== null &&
+    g.resume_below !== undefined &&
+    g.max_temp >= g.resume_below;
+  tgTemp.classList.toggle('hot', hot);
+  tgTemp.classList.toggle('warm', warm);
+  tickChecked();
 
   // error / failure-open / stalling states
   const hasErr = g.last_error !== null;
@@ -420,6 +555,8 @@ function renderTempGuard(): void {
   } else {
     tgError.className = 'tg-error';
   }
+
+  renderThresholds();
 }
 
 function renderHistory(): void {
@@ -669,6 +806,94 @@ tgSwitch.addEventListener('click', () => {
     });
 });
 
+/** Merge the live thresholds into the current state (never clobbers a
+ * /state poll that landed while the POST was in flight). */
+function applyThresholds(stall: number, resume: number): void {
+  const cur = state;
+  if (!cur?.temp_guard) return;
+  state = { ...cur, temp_guard: { ...cur.temp_guard, stall_above: stall, resume_below: resume } };
+}
+
+function submitThresholds(body: { stall: number; resume: number } | { reset: true }): void {
+  if (thrPending || conn === 'down') return;
+  thrPending = true;
+  thrError = null;
+  renderThresholds();
+  const call =
+    'reset' in body ? setTempThresholds({ reset: true }) : setTempThresholds(body.stall, body.resume);
+  call
+    .then((res) => {
+      if (res.ok && res.stall_above !== null && res.resume_below !== null) {
+        applyThresholds(res.stall_above, res.resume_below);
+        // The live pair is authoritative now: the fields re-seed from it
+        // and the "now" readout shows the value just applied.
+        thrDirty = false;
+      } else if (!res.ok) {
+        thrError = res.error ?? 'the proxy rejected the thresholds';
+      }
+    })
+    .catch((err) => {
+      if (err instanceof ApiError && err.status === 400) {
+        // the pair is invalid — the server says why, fields stay as typed
+        thrError = err.message;
+      } else {
+        setConnDown(err);
+        thrError = 'proxy unreachable';
+      }
+    })
+    .finally(() => {
+      thrPending = false;
+      renderTempGuard();
+      void pollState();
+    });
+}
+
+tgStall.addEventListener('input', () => {
+  thrDirty = true;
+  thrError = null;
+  renderThresholds();
+});
+
+tgResume.addEventListener('input', () => {
+  thrDirty = true;
+  thrError = null;
+  renderThresholds();
+});
+
+/** Validate the draft locally (the same rule the server enforces) and
+ * POST it. Shared by the apply button and Enter in either input. */
+function applyDraft(): void {
+  const draft = draftThresholds();
+  if (draft === null) {
+    thrError = 'enter both thresholds';
+    renderThresholds();
+    return;
+  }
+  if (draft.resume >= draft.stall) {
+    thrError = `resume must be lower than stall (${draft.resume} < ${draft.stall})`;
+    renderThresholds();
+    return;
+  }
+  // Enter is not gated by the button's disabled state: a draft that
+  // already matches the live pair has nothing to send (and would only
+  // round-trip a no-op POST).
+  if (thrLive !== null && draft.stall === thrLive.stall && draft.resume === thrLive.resume)
+    return;
+  submitThresholds(draft);
+}
+
+tgApply.addEventListener('click', applyDraft);
+
+for (const input of [tgStall, tgResume]) {
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault(); // the inputs are not in a <form>: no submit
+    applyDraft();
+  });
+}
+
+tgReset.addEventListener('click', () => submitThresholds({ reset: true }));
+
 pagePrev.addEventListener('click', () => {
   if (histPage > 1) {
     histPage -= 1;
@@ -698,6 +923,7 @@ function tick(): void {
   for (const row of iflightRows.values()) tickAge(row, row.baseAge, row.baseAt);
   renderHero();
   renderSync();
+  tickChecked();
 }
 
 /* ------------------------------------------------------------- boot */

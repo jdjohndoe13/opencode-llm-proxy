@@ -44,10 +44,11 @@ pnpm build      # tsc --noEmit + vite build → dist/
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /api/dashboard/state` | `{paused, paused_at, uptime_s, in_flight:[{id,model,path,stream,state,started_at,age_seconds,updated_at}], keepalive:{delay,interval}, events:[{ts,action}], temp_guard:{enabled,config_enabled,user_enabled,fail_open,max_temp,checked_at,last_error}}` (events newest first; `temp_guard` optional — the UI hides the strip when absent) |
+| `GET /api/dashboard/state` | `{paused, paused_at, uptime_s, in_flight:[{id,model,path,stream,state,started_at,age_seconds,updated_at}], keepalive:{delay,interval}, events:[{ts,action}], temp_guard:{enabled,config_enabled,user_enabled,fail_open,max_temp,checked_at,last_error}}` (events newest first; `temp_guard` optional — the UI hides the strip when absent; `checked_at` is wall-clock epoch seconds, `null` before the first snapshot; when the guard is armed by config `temp_guard` also carries `stall_above`, `resume_below` and the `default_*` pair the UI offers to reset to) |
 | `POST /api/dashboard/pause` | hold all new requests (two-step confirm in the UI) |
 | `POST /api/dashboard/resume` | release the hold |
 | `POST /api/dashboard/tempguard` | body `{"enabled":bool}` — flips the guard's `user_enabled` switch; `{"ok":true,"enabled":…}`; 400 on malformed body |
+| `POST /api/dashboard/tempguard/thresholds` | body `{"stall_above":n,"resume_below":n}` (either key alone works) or `{"reset":true}` — edits the live hysteresis pair in place; `{"ok":true,"stall_above":…,"resume_below":…}`; 400 with `{"error":…}` when the pair is invalid or the guard is disarmed by config |
 | `GET /api/dashboard/history?page=&size=` | `{total,page,size,pages,entries:[…]}` — server-side paginated request history from `stats.jsonl` |
 | `GET /api/dashboard/healthz` | `{ok, uptime_s}` |
 
