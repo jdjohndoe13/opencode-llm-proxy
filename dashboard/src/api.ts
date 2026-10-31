@@ -6,6 +6,7 @@
  * throwing mid-render.
  */
 import type {
+  Concurrency,
   DashboardState,
   HistoryPage,
   InFlightRequest,
@@ -18,10 +19,14 @@ const BASE = '/api/dashboard';
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(message: string, status = 0) {
+  /** parsed JSON body of the error response, when the server sent one
+   *  (the 400 envelopes carry a one-line `error` reason) */
+  readonly body: Record<string, unknown> | null;
+  constructor(message: string, status = 0, body: Record<string, unknown> | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -85,6 +90,15 @@ async function getJson(path: string, timeoutMs = 6000): Promise<unknown> {
   }
 }
 
+async function errorBody(res: Response): Promise<Record<string, unknown> | null> {
+  try {
+    const j = (await res.json()) as unknown;
+    return typeof j === 'object' && j !== null ? (j as Record<string, unknown>) : null;
+  } catch {
+    return null; // non-JSON error body (proxy/html error page)
+  }
+}
+
 async function postJson(path: string, body?: unknown, timeoutMs = 10000): Promise<unknown> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -99,7 +113,11 @@ async function postJson(path: string, body?: unknown, timeoutMs = 10000): Promis
       cache: 'no-store',
       signal: ac.signal,
     });
-    if (!res.ok) throw new ApiError(`POST ${path} → HTTP ${res.status}`, res.status);
+    if (!res.ok) {
+      // the 400 envelopes carry a one-line `error` reason — keep the body
+      // attached so callers can show the server's own message
+      throw new ApiError(`POST ${path} → HTTP ${res.status}`, res.status, await errorBody(res));
+    }
     return (await res.json()) as unknown;
   } catch (err) {
     if (err instanceof ApiError) throw err;
@@ -152,6 +170,10 @@ export function parseState(raw: unknown): DashboardState {
   if (o['temp_guard'] !== undefined && o['temp_guard'] !== null) {
     s.temp_guard = parseTempGuard(o['temp_guard']);
   }
+  // optional block — only attach when the backend implements the limiter
+  if (o['concurrency'] !== undefined && o['concurrency'] !== null) {
+    s.concurrency = parseConcurrency(o['concurrency']);
+  }
   return s;
 }
 
@@ -191,6 +213,29 @@ function parseTempGuard(raw: unknown): TempGuard {
   if (dStall !== undefined) g.default_stall_above = dStall;
   if (dResume !== undefined) g.default_resume_below = dResume;
   return g;
+}
+
+/**
+ * Concurrency block. `limit` 0 means UNLIMITED. Every field degrades to a
+ * safe value: missing/garbage counts become 0, and a missing/garbage
+ * `default_limit` falls back to the live limit so the UI degrades to
+ * "not edited, reset unavailable" rather than claiming a wrong .env value.
+ */
+function parseConcurrency(raw: unknown): Concurrency {
+  const o = obj(raw);
+  const count = (v: unknown): number => {
+    const n = num(v, NaN);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.round(n));
+  };
+  const limit = count(o['limit']);
+  const dflt = num(o['default_limit'], NaN);
+  return {
+    limit,
+    active: count(o['active']),
+    queued: count(o['queued']),
+    default_limit: Number.isFinite(dflt) ? Math.max(0, Math.round(dflt)) : limit,
+  };
 }
 
 function parseHistoryItem(raw: unknown) {
@@ -275,11 +320,66 @@ export async function setTempThresholds(
   b?: number,
 ): Promise<ThresholdResult> {
   const body = typeof a === 'number' ? { stall_above: a, resume_below: b } : a;
-  const o = obj(await postJson('/tempguard/thresholds', body));
-  return {
-    ok: bool(o['ok'], true),
-    stall_above: numOr(o['stall_above']),
-    resume_below: numOr(o['resume_below']),
-    error: typeof o['error'] === 'string' ? o['error'] : null,
-  };
+  try {
+    const o = obj(await postJson('/tempguard/thresholds', body));
+    return {
+      ok: bool(o['ok'], true),
+      stall_above: numOr(o['stall_above']),
+      resume_below: numOr(o['resume_below']),
+      error: typeof o['error'] === 'string' ? o['error'] : null,
+    };
+  } catch (err) {
+    // Only a 400 is "the proxy rejected this pair" — its body carries the
+    // reason, which beats the bare "HTTP 400" text the UI could show.
+    // Anything else (5xx, transport) must keep throwing so the caller can
+    // still raise the "proxy unreachable" banner.
+    if (err instanceof ApiError && err.status === 400) {
+      const reason = err.body ? str(err.body['error']) : '';
+      return {
+        ok: false,
+        stall_above: null,
+        resume_below: null,
+        error: reason !== '' ? reason : null,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * POST /concurrency — edits the live cap (in-memory, a restart re-reads
+ * .env). `limit` is an integer 0..10000 where 0 = UNLIMITED, or pass
+ * `{ reset: true }` to go back to the .env value. A rejected limit comes
+ * back as HTTP 400 with a one-line `error`; the server's own reason is
+ * preferred over the generic HTTP message when present.
+ */
+export interface ConcurrencyResult {
+  ok: boolean;
+  limit: number | null;
+  error: string | null;
+}
+
+export async function setConcurrency(limit: number): Promise<ConcurrencyResult>;
+export async function setConcurrency(reset: { reset: true }): Promise<ConcurrencyResult>;
+export async function setConcurrency(
+  a: number | { reset: true },
+): Promise<ConcurrencyResult> {
+  const body = typeof a === 'number' ? { limit: a } : a;
+  try {
+    const o = obj(await postJson('/concurrency', body));
+    return {
+      ok: bool(o['ok'], true),
+      limit: numOr(o['limit']),
+      error: typeof o['error'] === 'string' ? o['error'] : null,
+    };
+  } catch (err) {
+    // Only a 400 is "the proxy rejected this cap" — its body carries the
+    // reason. Anything else (5xx, transport) must keep throwing so the
+    // caller can still raise the "proxy unreachable" banner.
+    if (err instanceof ApiError && err.status === 400) {
+      const reason = err.body ? str(err.body['error']) : '';
+      return { ok: false, limit: null, error: reason !== '' ? reason : null };
+    }
+    throw err;
+  }
 }

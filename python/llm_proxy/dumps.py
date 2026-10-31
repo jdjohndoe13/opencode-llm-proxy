@@ -79,7 +79,7 @@ def write_stats(cfg, ctx: dict) -> None:
         "duration_ms": _floor(((ctx.get("_upstream_done") or ended) - sent_at) * 1000),
     }
     for key in ("_toolname_remap", "_toolname_strip", "_toolname_resend",
-                "_upstream_retries", "_paused_seconds"):
+                "_upstream_retries", "_paused_seconds", "_queued_seconds"):
         val = ctx.get(key)
         if val and val > 0:
             entry[key.lstrip("_")] = val

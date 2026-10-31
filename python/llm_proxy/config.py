@@ -43,6 +43,7 @@ class Config:
     keepalive_interval: float = 0.0
     upstream_timeout: float = 0.0
     upstream_retries: int = 0
+    concurrency_limit: int = 0
     temp_checks_enabled: bool = False
     temp_check_fail_open: bool = False
     temp_check_endpoint: str = ""
@@ -108,6 +109,15 @@ def load(env: dict[str, str] | None = None) -> Config:
     if retries != int(retries) or retries < 0:
         raise ConfigError("UPSTREAM_RETRIES must be a non-negative integer")
     cfg.upstream_retries = int(retries)
+
+    # Concurrent-request cap: 0 (the default) means unlimited.
+    limit = _require_number(
+        "CONCURRENCY_LIMIT", e.get("CONCURRENCY_LIMIT") or "0")
+    if limit != int(limit) or limit < 0:
+        raise ConfigError(
+            "CONCURRENCY_LIMIT must be a non-negative whole number "
+            "(0 = unlimited)")
+    cfg.concurrency_limit = int(limit)
 
     cfg.temp_checks_enabled = _enabled(e.get("TEMP_CHECK_ENABLED"))
     # When the monitor is unreachable: fail open (forward as if the

@@ -31,6 +31,7 @@ from . import dashboard, dumps, sse as sse_mod
 from .config import Config, load
 from .dumps import dump, dump_ts
 from .inflight import InFlight
+from .limiter import ConcurrencyLimiter
 from .markup import json_encode
 from .pause import PauseGate
 from .toolguard import ToolNameGuard, allowed_names
@@ -295,6 +296,23 @@ async def completions(request: web.Request) -> web.StreamResponse:
         log.info("client aborted while stalling for cool-down")
         return web.Response(status=444)  # nginx "no response" analog
 
+    # Concurrency limiter (last gate before the upstream). A slot is held
+    # only for the upstream exchange, so a request still waiting on the
+    # pause gate or the temperature guard costs nothing. Queued requests get
+    # the same deferred handshake + heartbeat treatment as the other gates.
+    limiter: ConcurrencyLimiter = request.app["limiter"]
+
+    async def _on_wait_limit() -> None:
+        if rec["state"] != "queued":
+            inflight.set_state(rec, "queued")
+        await commit.on_wait()
+
+    if not await limiter.acquire(ctx, _on_wait_limit):
+        log.info("client aborted while queued for a concurrency slot")
+        return web.Response(status=444)  # nginx "no response" analog
+    if rec["state"] == "queued":
+        inflight.set_state(rec, "waiting")
+
     ctx["_sent_at"] = time.time()
     inflight.set_state(rec, "upstream")
 
@@ -513,6 +531,14 @@ async def stats_middleware(request, handler):
         if ctx is not None:
             ctx["_ended"] = time.time()
             cfg = request.app["cfg"]
+            # Return the concurrency slot first: the release admits the next
+            # queued request, and that request's state change should not
+            # trail our own cleanup.
+            if ctx.get("_slot_held"):
+                try:
+                    request.app["limiter"].release()
+                except Exception:
+                    log.exception("concurrency slot release failed")
             rec = ctx.get("_inflight")
             if rec is not None:
                 try:
@@ -533,6 +559,7 @@ def create_app(cfg: Config) -> web.Application:
     app["cfg"] = cfg
     app["guard"] = ToolNameGuard(cfg.tool_name_guard, cfg.tool_name_retry,
                                  cfg.toolname_log)
+    app["limiter"] = ConcurrencyLimiter(cfg)
 
     async def _session_ctx(app):
         # force_close mirrors the Lua cosocket model: one fresh connection

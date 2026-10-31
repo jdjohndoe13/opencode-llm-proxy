@@ -1,9 +1,9 @@
 """In-flight request registry for the dashboard.
 
 Records every /v1/completions request from entry to exit so the dashboard
-can show what is currently waiting (paused / stalled / upstream). Purely
-in-memory; the dict is the single source of truth and each record is a
-plain dict so list_inflight() can cheaply copy it."""
+can show what is currently waiting (paused / stalled / queued / upstream).
+Purely in-memory; the dict is the single source of truth and each record is
+a plain dict so list_inflight() can cheaply copy it."""
 from __future__ import annotations
 
 import time

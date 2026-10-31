@@ -47,6 +47,9 @@ services:
       # Upstream exchange deadline / resend budget.
       UPSTREAM_TIMEOUT: ${UPSTREAM_TIMEOUT:?UPSTREAM_TIMEOUT must be set (copy .env.example to .env)}
       UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:?UPSTREAM_RETRIES must be set (copy .env.example to .env)}
+      # Cap on requests at the LLM server at once; 0 (default) = unlimited.
+      # Also editable at runtime from the dashboard (resets on restart).
+      CONCURRENCY_LIMIT: ${CONCURRENCY_LIMIT:-0}
       # Where request/response dumps and stats.jsonl are written.
       LOG_DIR: ${LOG_DIR:-/var/log/nginx/completions}
     volumes:

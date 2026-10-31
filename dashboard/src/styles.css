@@ -29,6 +29,7 @@
   --red: #ff5d55;
   --red-deep: #3d1712;
   --red-glow: rgba(255, 93, 85, 0.16);
+  --orange: #ff9257;
   --cyan: #62c8d8;
 
   --mono: "IBM Plex Mono", "Cascadia Mono", "JetBrains Mono", ui-monospace,
@@ -707,6 +708,47 @@ body::before {
   color: var(--red);
 }
 
+/* ---------- concurrency limiter strip (secondary control) ---------- */
+
+/* Reuses .tg-strip / .tg-title / .tg-cur / .tg-facts / .tg-thr / .tg-apply /
+ * .tg-reset / .tg-edited / .tg-thr-err from the guard strip above — only the
+ * genuinely new layout lives here. */
+
+/* the queue is the interesting number: the limiter is actively holding
+ * requests back, so it stays amber while anything is waiting. The leading
+ * separator rides along so it disappears with the (hidden) queue count, and
+ * the negative margin tightens it against the 16px .tg-facts gap so the
+ * whole thing reads "2/4 in use · 1 queued". */
+.cl-queued {
+  color: var(--ink-faint);
+  white-space: nowrap;
+  margin-left: -8px;
+}
+
+.cl-queued::before {
+  content: "·";
+  margin-right: 5px;
+}
+
+.cl-queued[hidden] {
+  display: none;
+}
+
+.cl-queued b {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+/* the cap is saturated — every slot is held */
+.tg-facts b.full {
+  color: var(--amber);
+}
+
+/* the draft cap can be 5 digits (max 10000), a touch wider than a °C pair */
+.cl-edit input {
+  width: 58px;
+}
+
 /* ---------- panels ---------- */
 
 .panel {
@@ -873,6 +915,14 @@ th.num {
   color: var(--cyan);
   border-color: rgba(98, 200, 216, 0.45);
   background: rgba(98, 200, 216, 0.08);
+}
+
+/* held by the concurrency limiter, waiting for a free slot — muted orange,
+ * i.e. the amber family but distinct from the "waiting" (pre-upstream) tag */
+.badge.st-queued {
+  color: var(--orange);
+  border-color: rgba(255, 146, 87, 0.45);
+  background: rgba(255, 146, 87, 0.08);
 }
 
 .badge.st-other {

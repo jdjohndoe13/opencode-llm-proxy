@@ -9,6 +9,7 @@ the backend):
   GET  /api/dashboard/history   paginated stats.jsonl tail, newest first
   POST /api/dashboard/tempguard             on/off for the temperature guard
   POST /api/dashboard/tempguard/thresholds  edit the hysteresis pair
+  POST /api/dashboard/concurrency           edit the concurrent-request cap
   GET  /api/dashboard/healthz   {ok:true} — lets the UI tell proxy vs backend
   GET  /dashboard               the built static UI (python/llm_proxy/static)
   GET  /dashboard/assets/...    static assets
@@ -165,6 +166,7 @@ async def state(request: web.Request) -> web.Response:
         },
         "events": gate.events(),
         "temp_guard": request.app["temp_guard"].status(),
+        "concurrency": request.app["limiter"].status(),
     })
 
 
@@ -261,6 +263,41 @@ async def tempguard_thresholds(request: web.Request) -> web.Response:
                   "resume_below": guard.resume_below})
 
 
+async def concurrency(request: web.Request) -> web.Response:
+    """POST /api/dashboard/concurrency  {"limit": n}  or  {"reset": true}
+
+    Runtime edit of the concurrent-request cap (0 = unlimited). In-memory
+    like the pause gate and the guard's controls, so a restart re-reads
+    CONCURRENCY_LIMIT from .env. Raising the limit admits as many queued
+    requests as the new capacity allows; lowering it never disturbs requests
+    that already hold a slot."""
+    limiter = request.app["limiter"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return _json({"ok": False,
+                      "error": "expected {\"limit\": n} or {\"reset\": true}"},
+                     status=400)
+    if body.get("reset") is True:
+        limiter.reset_limit()
+    else:
+        unknown = set(body) - {"limit"}
+        if unknown:
+            return _json({"ok": False,
+                          "error": f"unexpected keys: {', '.join(sorted(unknown))}"},
+                         status=400)
+        if "limit" not in body:
+            return _json({"ok": False, "error": "expected \"limit\""},
+                         status=400)
+        applied, err = limiter.set_limit(body["limit"])
+        if not applied:
+            return _json({"ok": False, "error": err}, status=400)
+    return _json({"ok": True, "limit": limiter.limit,
+                  "default_limit": limiter.default_limit})
+
+
 # ---------------------------------------------------------------- static UI
 
 def _content_type(path: Path) -> str:
@@ -337,6 +374,7 @@ def register(app: web.Application) -> None:
     r.add_route("*", "/api/dashboard/tempguard", _api(tempguard))
     r.add_route("*", "/api/dashboard/tempguard/thresholds",
                 _api(tempguard_thresholds))
+    r.add_route("*", "/api/dashboard/concurrency", _api(concurrency))
     r.add_route("*", "/api/dashboard/healthz", _api(healthz))
     r.add_route("*", "/api/dashboard", _preflight)
     r.add_route("*", "/api/dashboard/{tail:.*}", _preflight)

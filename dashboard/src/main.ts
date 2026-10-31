@@ -10,7 +10,7 @@
  * known state, flags it stale, and shows a "proxy unreachable" banner.
  */
 import './styles.css';
-import { ApiError, fetchHistory, fetchState, pause, resume, setTempGuard, setTempThresholds } from './api';
+import { ApiError, fetchHistory, fetchState, pause, resume, setConcurrency, setTempGuard, setTempThresholds } from './api';
 import {
   fmtAgo,
   fmtClock,
@@ -48,6 +48,22 @@ let thrPending = false;
 let thrError: string | null = null;
 let thrLive: { stall: number; resume: number } | null = null;
 let thrDirty = false;
+
+/* Concurrency limiter editor — same shape as the threshold editor.
+ * `clLive` is the cap the proxy is applying right now (shown in the "now"
+ * readout, never touched by typing; 0 = unlimited). `clDirty` means the
+ * field holds an unapplied draft, which is what keeps a 2s /state poll from
+ * overwriting the user's typing. `clPending` guards the in-flight POST and
+ * `clError` holds a rejection message until the next successful sync or
+ * edit. */
+let clPending = false;
+let clError: string | null = null;
+let clLive: number | null = null;
+let clDirty = false;
+
+/** the server rejects anything outside this range (0 = unlimited) */
+const CL_MIN = 0;
+const CL_MAX = 10000;
 
 let histPage = 1;
 let histSize = 20;
@@ -142,6 +158,34 @@ app.innerHTML = `
       <span class="tg-tag" id="tg-tag">—</span>
       <span class="tg-msg" id="tg-msg"></span>
     </span>
+  </section>
+
+  <section class="tg-strip" id="cl-strip" hidden>
+    <span class="tg-title">Concurrency</span>
+    <span class="tg-cur" id="cl-cur"
+          title="The cap the proxy is applying right now">
+      now <b id="cl-cur-limit">—</b>
+    </span>
+    <span class="tg-facts">
+      <span><b id="cl-use">—</b> in use</span>
+      <span class="cl-queued" id="cl-queue" hidden>
+        <b id="cl-queued">0</b> queued
+      </span>
+    </span>
+    <span class="tg-thr cl-edit">
+      <label for="cl-limit">cap&nbsp;=</label>
+      <input id="cl-limit" type="number" step="1" min="0" max="10000"
+             inputmode="numeric"
+             title="New cap on requests at the LLM server at once — 0 means unlimited, applied when you press Apply" />
+      <span class="tg-unit">0 = unlimited</span>
+      <button class="tg-apply" id="cl-apply" type="button" disabled
+              title="Apply the cap in the field">apply</button>
+      <button class="tg-reset" id="cl-reset" type="button" disabled
+              title="Restore the .env cap">reset</button>
+      <span class="tg-edited" id="cl-edited" hidden>edited</span>
+    </span>
+    <span class="tg-hint">requests held at the proxy until a slot frees · cap and queue reset on restart</span>
+    <span class="tg-thr-err" id="cl-err"></span>
   </section>
 
   <section class="panel">
@@ -261,6 +305,17 @@ const tgApply = $<HTMLButtonElement>('#tg-apply');
 const tgReset = $<HTMLButtonElement>('#tg-reset');
 const tgEdited = $<HTMLElement>('#tg-edited');
 const tgThrErr = $<HTMLElement>('#tg-thr-err');
+const clStrip = $<HTMLElement>('#cl-strip');
+const clCur = $<HTMLElement>('#cl-cur');
+const clCurLimit = $<HTMLElement>('#cl-cur-limit');
+const clUse = $<HTMLElement>('#cl-use');
+const clQueue = $<HTMLElement>('#cl-queue');
+const clQueued = $<HTMLElement>('#cl-queued');
+const clLimit = $<HTMLInputElement>('#cl-limit');
+const clApply = $<HTMLButtonElement>('#cl-apply');
+const clReset = $<HTMLButtonElement>('#cl-reset');
+const clEdited = $<HTMLElement>('#cl-edited');
+const clErr = $<HTMLElement>('#cl-err');
 const favIcon = $opt<HTMLLinkElement>('link[rel="icon"]');
 
 /* ------------------------------------------------------------- rendering */
@@ -283,6 +338,8 @@ function stateBadgeClass(stateName: string): string {
       return 'badge st-paused';
     case 'stalled':
       return 'badge st-stalled';
+    case 'queued':
+      return 'badge st-queued';
     default:
       return 'badge st-other';
   }
@@ -512,7 +569,6 @@ function renderTempGuard(): void {
     return;
   }
   tgStrip.hidden = false;
-
   // effective state pill: ON / OFF / INACTIVE (config off)
   const configOff = !g.config_enabled;
   tgState.className = configOff ? 'tg-state inactive' : g.enabled ? 'tg-state on' : 'tg-state off';
@@ -557,6 +613,82 @@ function renderTempGuard(): void {
   }
 
   renderThresholds();
+}
+
+/** The draft cap the user has typed, or null when the field is unusable. */
+function draftLimit(): number | null {
+  const raw = clLimit.value.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+  return n;
+}
+
+/** 0 reads as "unlimited" everywhere the user sees it. */
+function fmtLimit(n: number): string {
+  return n === 0 ? 'unlimited' : String(n);
+}
+
+function renderConcurrency(): void {
+  const c = state?.concurrency;
+  if (!c) {
+    // backend doesn't expose the limiter — hide the whole strip.
+    // (Unlike the guard, the strip is NOT hidden for limit = 0: unlimited
+    // is a real, meaningful state of an always-present limiter.)
+    clStrip.hidden = true;
+    clLive = null;
+    return;
+  }
+  clStrip.hidden = false;
+
+  const changed = clLive !== null && clLive !== c.limit;
+  clLive = c.limit;
+
+  // The "now" readout is always the live cap — typing never touches it, so
+  // the value being applied stays visible while a new one is typed in.
+  clCurLimit.textContent = fmtLimit(c.limit);
+  clCur.title =
+    `The cap the proxy is applying right now (.env: ${fmtLimit(c.default_limit)})`;
+
+  // live utilisation: "2/4 in use · 1 queued", or "4 in use" with no cap.
+  // The queue count is the interesting number — it means the limiter is
+  // actively holding requests back, so it is emphasised while non-zero.
+  clUse.textContent = c.limit === 0 ? String(c.active) : `${c.active}/${c.limit}`;
+  clUse.classList.toggle('full', c.limit > 0 && c.active >= c.limit);
+  clQueue.hidden = c.queued <= 0;
+  clQueued.textContent = String(c.queued);
+
+  // The field is the user's draft: re-seed it from the live cap only while
+  // nothing has been typed (or right after a successful apply/reset), so a
+  // 2s poll can never overwrite typing.
+  if (!clDirty) clLimit.value = String(c.limit);
+
+  const draft = draftLimit();
+  const differs = draft !== null && draft !== c.limit;
+  const invalid = draft !== null && (draft < CL_MIN || draft > CL_MAX);
+
+  const atDefault = c.limit === c.default_limit;
+  clEdited.hidden = atDefault;
+  clReset.disabled = atDefault || clPending || conn === 'down';
+  clApply.disabled = clPending || conn === 'down' || !differs || invalid;
+  clLimit.disabled = clPending || conn === 'down';
+
+  // Local validation first: the same rules the server enforces.
+  let msg = clError;
+  if (msg === null && clLimit.value.trim() !== '' && draft === null) {
+    msg = 'the cap must be a whole number';
+  }
+  if (msg === null && draft !== null && (draft < CL_MIN || draft > CL_MAX)) {
+    msg = `the cap must be between ${CL_MIN} and ${CL_MAX} (0 = unlimited)`;
+  }
+  const wasShown = clErr.classList.contains('show');
+  clErr.textContent = msg ?? '';
+  clErr.classList.toggle('show', msg !== null);
+  if (msg !== null && !wasShown && !changed) {
+    clErr.classList.add('flash');
+  } else if (msg === null) {
+    clErr.classList.remove('flash');
+  }
 }
 
 function renderHistory(): void {
@@ -692,6 +824,7 @@ async function pollState(): Promise<void> {
   renderInflight();
   renderButton();
   renderTempGuard();
+  renderConcurrency();
   renderFooter();
   renderSync();
 }
@@ -893,6 +1026,88 @@ for (const input of [tgStall, tgResume]) {
 }
 
 tgReset.addEventListener('click', () => submitThresholds({ reset: true }));
+
+/* ---------- concurrency limiter actions ---------- */
+
+/** Merge the live cap into the current state (never clobbers a /state poll
+ * that landed while the POST was in flight). */
+function applyLimit(limit: number): void {
+  const cur = state;
+  if (!cur?.concurrency) return;
+  state = { ...cur, concurrency: { ...cur.concurrency, limit } };
+}
+
+function submitLimit(body: { limit: number } | { reset: true }): void {
+  if (clPending || conn === 'down') return;
+  clPending = true;
+  clError = null;
+  renderConcurrency();
+  const call =
+    'reset' in body ? setConcurrency({ reset: true }) : setConcurrency(body.limit);
+  call
+    .then((res) => {
+      if (res.ok && res.limit !== null) {
+        applyLimit(res.limit);
+        // The live cap is authoritative now: the field re-seeds from it
+        // and the "now" readout shows the value just applied.
+        clDirty = false;
+      } else if (!res.ok) {
+        clError = res.error ?? 'the proxy rejected the cap';
+      }
+    })
+    .catch((err) => {
+      if (err instanceof ApiError && err.status === 400) {
+        // the cap is invalid — the server says why, the field stays as typed
+        clError = err.message;
+      } else {
+        setConnDown(err);
+        clError = 'proxy unreachable';
+      }
+    })
+    .finally(() => {
+      clPending = false;
+      renderConcurrency();
+      void pollState();
+    });
+}
+
+clLimit.addEventListener('input', () => {
+  clDirty = true;
+  clError = null;
+  renderConcurrency();
+});
+
+/** Validate the draft locally (the same rules the server enforces) and
+ * POST it. Shared by the apply button and Enter in the input. */
+function applyDraftLimit(): void {
+  const draft = draftLimit();
+  if (draft === null) {
+    clError =
+      clLimit.value.trim() === '' ? 'enter a cap (0 = unlimited)' : 'the cap must be a whole number';
+    renderConcurrency();
+    return;
+  }
+  if (draft < CL_MIN || draft > CL_MAX) {
+    clError = `the cap must be between ${CL_MIN} and ${CL_MAX} (0 = unlimited)`;
+    renderConcurrency();
+    return;
+  }
+  // Enter is not gated by the button's disabled state: a draft that
+  // already matches the live cap has nothing to send (and would only
+  // round-trip a no-op POST).
+  if (clLive !== null && draft === clLive) return;
+  submitLimit({ limit: draft });
+}
+
+clApply.addEventListener('click', applyDraftLimit);
+
+clLimit.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault(); // the input is not in a <form>: no submit
+  applyDraftLimit();
+});
+
+clReset.addEventListener('click', () => submitLimit({ reset: true }));
 
 pagePrev.addEventListener('click', () => {
   if (histPage > 1) {

@@ -129,6 +129,7 @@ cp .env.example .env
 | `KEEPALIVE_INTERVAL` | Seconds between heartbeat chunks while the upstream is still generating |
 | `UPSTREAM_TIMEOUT` | Seconds each upstream attempt (connect + send + full response) has to answer; when it expires without a (complete) response, the connection is dropped |
 | `UPSTREAM_RETRIES` | How many times the identical request is resent after such a timeout (a request is sent at most `UPSTREAM_RETRIES + 1` times) |
+| `CONCURRENCY_LIMIT` | Maximum number of requests allowed at the LLM server at once; `0` (default) means unlimited. Requests that arrive while the cap is full are held in arrival order (shown as `queued` on the dashboard) and the oldest is released as soon as a running request finishes. Editable at runtime from the dashboard (resets to this value on restart). A slot is taken only for the upstream exchange, so requests held by the pause gate or the temperature guard do not consume one |
 | `TOOL_NAME_GUARD` | `remap` (default), `strip` or `off`. When tools are defined, markup-style tool calls in the response (including the `antml:` namespace) are converted to real `tool_calls` and their names validated against the request's tool list: `remap` fixes a hallucinated name when a unique allowed candidate exists (edit distance ≤ 2, or a unique shared intent token ≥ 5 chars within the same `server_` prefix), `strip` always drops unknown names. Dropped calls are replaced by a corrective note in the assistant content tagged `[tool-name-fixer]`; every decision is logged to `logs/toolname_fixes.jsonl` |
 | `TOOL_NAME_RETRY` | `1` (default) or `0`. When `1` and the guard would strip anything, the identical request is silently resent once (only empty heartbeat chunks have reached the client at that point) and the fresh sample is adopted if it comes back as a clean chat completion; otherwise the original response is demoted as above. Decisions appear in `logs/*.jsonl` stats (`toolname_resend`) and nginx warnings |
 
@@ -294,9 +295,9 @@ dies still fail — nothing the proxy can do about that.) The pause state
 is in-memory only: a proxy restart always boots running.
 
 The dashboard shows the pause state, live in-flight requests (model,
-stream, age, waiting/paused/stalled/upstream), the recent pause/resume
+stream, age, waiting/paused/stalled/queued/upstream), the recent pause/resume
 events and the paginated request history read from `logs/stats.jsonl`
-(newest first; `paused_seconds` is recorded per request).
+(newest first; `paused_seconds` and `queued_seconds` are recorded per request).
 
 API (plain JSON, no auth — localhost tool):
 
@@ -313,6 +314,13 @@ POST /api/dashboard/tempguard/thresholds  {"stall_above":n,"resume_below":n}
                                        also reset on proxy restart; 400 when
                                        the pair is invalid or the guard is
                                        disarmed by config
+POST /api/dashboard/concurrency        {"limit":n} (0 = unlimited) or
+                                       {"reset":true} — live concurrent-
+                                       request cap, also reset on proxy
+                                       restart; raising it admits queued
+                                       requests, lowering it never disturbs
+                                       requests already running; 400 when
+                                       the value is invalid
 GET  /api/dashboard/history?page=1&size=20   stats.jsonl tail, newest first
 GET  /api/dashboard/healthz            {ok:true} — proxy vs backend
 ```

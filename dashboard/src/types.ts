@@ -11,7 +11,7 @@ export interface InFlightRequest {
   model: string;
   path: string;
   stream: boolean;
-  /** "waiting" | "upstream" | "paused" | backend-specific extras */
+  /** "waiting" | "queued" | "upstream" | "paused" | backend-specific extras */
   state: string;
   /** unix seconds (float) */
   started_at: number;
@@ -57,6 +57,22 @@ export interface TempGuard {
   default_resume_below?: number;
 }
 
+/**
+ * Concurrent request limiter (secondary runtime control).
+ * Caps how many requests may be at the LLM server at once; anything over
+ * the cap is held (queued) until a running request finishes.
+ */
+export interface Concurrency {
+  /** live cap the proxy is applying; 0 = UNLIMITED */
+  limit: number;
+  /** requests currently holding a slot (at the LLM server) */
+  active: number;
+  /** requests being held back, waiting for a slot */
+  queued: number;
+  /** the .env value the reset button restores (0 = unlimited) */
+  default_limit: number;
+}
+
 export interface ProxyEvent {
   /** unix seconds (float) */
   ts: number;
@@ -76,6 +92,8 @@ export interface DashboardState {
   events: ProxyEvent[];
   /** present only when the backend implements the guard */
   temp_guard?: TempGuard;
+  /** present only when the backend implements the limiter */
+  concurrency?: Concurrency;
 }
 
 export interface HistoryItem {
