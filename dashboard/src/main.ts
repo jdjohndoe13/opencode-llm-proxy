@@ -15,6 +15,7 @@ import {
   fmtAgo,
   fmtClock,
   fmtDurShort,
+  fmtDurSplit,
   fmtInt,
   fmtSecondsOpt,
   fmtTimeFromMs,
@@ -204,7 +205,7 @@ app.innerHTML = `
             <th>Model</th>
             <th>Path</th>
             <th>Stream</th>
-            <th class="num">Age</th>
+            <th class="num">Duration</th>
             <th>State</th>
           </tr>
         </thead>
@@ -233,6 +234,7 @@ app.innerHTML = `
             <th class="num">Total</th>
             <th class="num">Stall</th>
             <th class="num">Paused</th>
+            <th class="num">Queued</th>
           </tr>
         </thead>
         <tbody id="hist-body"></tbody>
@@ -352,9 +354,16 @@ interface RowCells {
   baseAge: number;
   /** unix seconds when the server computed baseAge (NaN if absent) */
   baseAt: number;
+  /** held/upstream seconds as reported at last sync (NaN if unsupported) */
+  baseHeld: number;
+  baseUp: number;
+  /** current state — decides which bucket the interpolated time grows */
+  state: string;
   /** model|path|stream|state — rebuild the row when this changes */
   sig: string;
 }
+
+const HELD_STATES = ['paused', 'queued', 'stalled'];
 
 const iflightRows = new Map<string, RowCells>();
 
@@ -367,7 +376,22 @@ function tickAge(row: RowCells, baseAge: number, baseAt: number): void {
   } else {
     age = baseAge + ageOffsetMs / 1000;
   }
-  row.age.textContent = fmtDurShort(age);
+  // The held/upstream split only advances while the request is in a
+  // state that accumulates it; "waiting" (between gates) only grows the
+  // total, so the breakdown stays visibly honest.
+  let held = row.baseHeld;
+  let up = row.baseUp;
+  const extra = age - baseAge;
+  if (Number.isFinite(held) && HELD_STATES.includes(row.state)) held += extra;
+  if (Number.isFinite(up) && row.state === 'upstream') up += extra;
+  if (Number.isFinite(held) || Number.isFinite(up)) {
+    row.age.textContent = fmtDurSplit(
+      age,
+      Number.isFinite(held) ? held : 0,
+      Number.isFinite(up) ? up : 0);
+  } else {
+    row.age.textContent = fmtDurShort(age);
+  }
   row.age.classList.toggle('old', age > 30);
 }
 
@@ -395,11 +419,23 @@ function renderInflight(): void {
       tdState.appendChild(el('span', stateBadgeClass(req.state), req.state));
       tr.append(tdModel, tdPath, tdStream, tdAge, tdState);
       iflightBody.appendChild(tr);
-      row = { tr, age: tdAge, baseAge: req.age_seconds, baseAt: req.updated_at, sig };
+      row = {
+        tr,
+        age: tdAge,
+        baseAge: req.age_seconds,
+        baseAt: req.updated_at,
+        baseHeld: req.held_seconds ?? NaN,
+        baseUp: req.upstream_seconds ?? NaN,
+        state: req.state,
+        sig,
+      };
       iflightRows.set(key, row);
     } else {
       row.baseAge = req.age_seconds;
       row.baseAt = req.updated_at;
+      row.baseHeld = req.held_seconds ?? NaN;
+      row.baseUp = req.upstream_seconds ?? NaN;
+      row.state = req.state;
     }
     tickAge(row, row.baseAge, row.baseAt);
     // keep DOM order stable if the server reorders
@@ -721,13 +757,24 @@ function renderHistory(): void {
       return td2;
     };
     // column order must match the <thead>: time, model, status, duration,
-    // prompt, completion, total, stall, paused
+    // prompt, completion, total, stall, paused, queued
     td('path', fmtTimeFromMs(item.start_time_unix, item.start_time));
     td('model', item.model);
     const tdStatus = td('num', '');
     const ok = item.status >= 200 && item.status < 300;
     tdStatus.appendChild(el('span', `badge ${ok ? 'ok' : 'err'}`, String(item.status || '—')));
-    td('num', fmtDurShort(item.duration_ms / 1000));
+    // Duration = total wall-clock in the proxy, with the held/processed
+    // split when anything was held: "8.0s (5.0q + 3.0p)".
+    //   held  = paused + queued + stall (the gates before the upstream)
+    //   up    = duration_ms, the upstream exchange itself
+    // Older stats.jsonl lines have no total_seconds, so the total falls
+    // back to the upstream duration and the breakdown is omitted.
+    const up = item.duration_ms / 1000;
+    const held =
+      (item.paused_seconds ?? 0) + (item.queued_seconds ?? 0) + (item.stall_seconds ?? 0);
+    const total = item.total_seconds !== undefined ? item.total_seconds : up;
+    const tdDur = td('num', fmtDurSplit(total, held, up));
+    if (held > 0) tdDur.classList.add('held');
     td('num', fmtInt(item.prompt_tokens));
     td('num', fmtInt(item.completion_tokens));
     td('num', fmtInt(item.total_tokens));
@@ -736,6 +783,10 @@ function renderHistory(): void {
     const paused = td('num', fmtSecondsOpt(item.paused_seconds));
     if (item.paused_seconds !== undefined && item.paused_seconds > 0) {
       paused.classList.add('stall');
+    }
+    const queued = td('num', fmtSecondsOpt(item.queued_seconds));
+    if (item.queued_seconds !== undefined && item.queued_seconds > 0) {
+      queued.classList.add('stall');
     }
     frag.appendChild(tr);
   }

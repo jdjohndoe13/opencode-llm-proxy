@@ -955,6 +955,12 @@ th.num {
   color: var(--amber);
 }
 
+/* duration cell that carries a held/processed breakdown: the total is the
+ * interesting number, so tint it like the held phase it contains */
+td.held {
+  color: var(--amber);
+}
+
 /* ---------- history pager ---------- */
 
 .pager {

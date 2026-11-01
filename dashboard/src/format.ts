@@ -78,3 +78,16 @@ export function fmtSecondsOpt(v: number | undefined): string {
   if (v === undefined || !Number.isFinite(v) || v <= 0) return '—';
   return v < 10 ? `${v.toFixed(1)}s` : `${Math.round(v)}s`;
 }
+
+/**
+ * Split duration for the per-request tables: "8.0s (5.0q + 3.0p)" —
+ * total wall-clock, held (queued/paused/stalled) and upstream processing.
+ * The breakdown is omitted when nothing was held, so ordinary rows stay
+ * compact and the interesting ones stand out.
+ */
+export function fmtDurSplit(total: number, held: number, up: number): string {
+  if (!Number.isFinite(total)) return '—';
+  const t = fmtDurShort(total);
+  if (!Number.isFinite(held) || held < 0.05) return t;
+  return `${t} (${fmtDurShort(held)}q + ${fmtDurShort(Number.isFinite(up) ? up : 0)}p)`;
+}

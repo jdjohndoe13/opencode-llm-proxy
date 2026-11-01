@@ -263,7 +263,9 @@ def test_state_endpoint_reflects_pause_resume(tmp_path):
             assert st["paused_at"] is None
             assert st["in_flight"] == []
             assert st["keepalive"] == {"delay": 1.0, "interval": 1.0}
-            assert st["uptime_s"] > 0
+            # the gate is created during create_app, so a fast first poll
+            # can legitimately round to 0.0
+            assert st["uptime_s"] >= 0
             assert st["events"] == []
 
             await _pause(proxy)

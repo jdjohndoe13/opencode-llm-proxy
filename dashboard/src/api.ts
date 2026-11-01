@@ -8,6 +8,7 @@
 import type {
   Concurrency,
   DashboardState,
+  HistoryItem,
   HistoryPage,
   InFlightRequest,
   ProxyEvent,
@@ -134,7 +135,7 @@ function parseInFlight(raw: unknown): InFlightRequest {
   const o = obj(raw);
   // contract: "age_seconds"; fall back to legacy "age_s" if present
   const age = o['age_seconds'] !== undefined ? o['age_seconds'] : o['age_s'];
-  return {
+  const r: InFlightRequest = {
     id: str(o['id'], '·'),
     model: str(o['model'], '—'),
     path: str(o['path'], '—'),
@@ -144,6 +145,13 @@ function parseInFlight(raw: unknown): InFlightRequest {
     age_seconds: num(age),
     updated_at: num(o['updated_at'], NaN),
   };
+  // optional phase split — absent on older backends, then the Age cell
+  // shows the plain age as before
+  const held = numOr(o['held_seconds']);
+  if (held !== null) r.held_seconds = held;
+  const up = numOr(o['upstream_seconds']);
+  if (up !== null) r.upstream_seconds = up;
+  return r;
 }
 
 function parseEvent(raw: unknown): ProxyEvent {
@@ -251,10 +259,13 @@ function parseHistoryItem(raw: unknown) {
     start_time_unix: num(o['start_time_unix']),
     stall_seconds: num(o['stall_seconds']),
   };
-  if (o['paused_seconds'] !== undefined && o['paused_seconds'] !== null) {
-    return { ...item, paused_seconds: num(o['paused_seconds']) };
+  const out: Record<string, unknown> = { ...item };
+  // optional per-phase fields — older stats.jsonl lines lack them
+  for (const key of ['paused_seconds', 'queued_seconds', 'total_seconds'] as const) {
+    const v = numOr(o[key]);
+    if (v !== null) out[key] = v;
   }
-  return item;
+  return out as unknown as HistoryItem;
 }
 
 export function parseHistory(raw: unknown): HistoryPage {

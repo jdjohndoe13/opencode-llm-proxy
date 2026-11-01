@@ -19,6 +19,13 @@ export interface InFlightRequest {
   age_seconds: number;
   /** unix seconds (float) — when the server last refreshed this entry */
   updated_at: number;
+  /**
+   * Seconds spent held (paused / queued / stalled) so far, including the
+   * current state if it is a held one. Optional: older backends omit it.
+   */
+  held_seconds?: number;
+  /** seconds spent at the LLM server so far; optional, see held_seconds */
+  upstream_seconds?: number;
 }
 
 export interface KeepaliveConfig {
@@ -111,6 +118,14 @@ export interface HistoryItem {
   stall_seconds: number;
   /** optional — only present when the request was held by a pause */
   paused_seconds?: number;
+  /** optional — only present when the request was held by the limiter */
+  queued_seconds?: number;
+  /**
+   * Full wall-clock time in the proxy (held + upstream + overhead).
+   * Optional: older stats.jsonl lines lack it, then duration_ms is the
+   * best available total.
+   */
+  total_seconds?: number;
 }
 
 export interface HistoryPage {

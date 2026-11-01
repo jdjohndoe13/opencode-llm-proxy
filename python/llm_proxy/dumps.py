@@ -77,6 +77,9 @@ def write_stats(cfg, ctx: dict) -> None:
         "start_time_unix": _floor(sent_at * 1000),
         "start_time": _utc_str(math.floor(sent_at + 0.5)),
         "duration_ms": _floor(((ctx.get("_upstream_done") or ended) - sent_at) * 1000),
+        # full wall-clock time from entering the proxy to leaving it,
+        # including every held phase (pause / temp stall / concurrency queue)
+        "total_seconds": _floor((ended - ctx.get("_start", sent_at)) * 1000) / 1000,
     }
     for key in ("_toolname_remap", "_toolname_strip", "_toolname_resend",
                 "_upstream_retries", "_paused_seconds", "_queued_seconds"):

@@ -295,9 +295,13 @@ dies still fail — nothing the proxy can do about that.) The pause state
 is in-memory only: a proxy restart always boots running.
 
 The dashboard shows the pause state, live in-flight requests (model,
-stream, age, waiting/paused/stalled/queued/upstream), the recent pause/resume
+stream, duration with the held/processed split, waiting/paused/stalled/queued/upstream), the recent pause/resume
 events and the paginated request history read from `logs/stats.jsonl`
-(newest first; `paused_seconds` and `queued_seconds` are recorded per request).
+(newest first; `paused_seconds`, `queued_seconds` and `total_seconds` are
+recorded per request). Each duration cell reads
+`8.0s (5.0q + 3.0p)` — total wall-clock, of which 5.0s held by the pause
+gate / temperature guard / concurrency queue and 3.0s spent at the LLM
+server; the breakdown is omitted when nothing was held.
 
 API (plain JSON, no auth — localhost tool):
 

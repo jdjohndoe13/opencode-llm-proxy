@@ -11,12 +11,14 @@ number of requests that reached the LLM server is directly observable.
 """
 import asyncio
 import json
+import time
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from llm_proxy.config import Config, ConfigError, load
+from llm_proxy.inflight import InFlight
 from llm_proxy.limiter import ConcurrencyLimiter, validate_limit
 from llm_proxy.server import create_app
 
@@ -438,6 +440,110 @@ def test_queued_requests_are_reported_in_flight(tmp_path):
                 assert r.status == 200
             async with await asyncio.wait_for(holder, 5) as r:
                 assert r.status == 200
+        finally:
+            for t in (task, holder):
+                if t is not None:
+                    t.cancel()
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+# ------------------------------------------------------- phase accounting
+
+def test_inflight_accumulates_phases_across_transitions():
+    """set_state closes the interval of the state it leaves into the right
+    bucket: held states (paused/queued/stalled) into held_seconds, upstream
+    into upstream_seconds, waiting into neither."""
+    inf = InFlight()
+    rec = inf.add("r1", model="m", path="/v1/chat/completions", stream=False)
+    # rewind the clock: 9s of history = 5s paused + 3s upstream + 1s stalled.
+    # set_state closes the interval from updated_at to the real now, so each
+    # step rewinds updated_at by the duration that state should have been
+    # open, then transitions.
+    rec["started_at"] = time.time() - 9.0
+    rec["state"] = "paused"
+    rec["updated_at"] = time.time() - 5.0
+    inf.set_state(rec, "upstream")
+    assert rec["held_seconds"] == pytest.approx(5.0, abs=0.2)
+    assert rec["upstream_seconds"] == 0.0
+
+    rec["updated_at"] = time.time() - 3.0
+    inf.set_state(rec, "stalled")
+    assert rec["upstream_seconds"] == pytest.approx(3.0, abs=0.2)
+    assert rec["held_seconds"] == pytest.approx(5.0, abs=0.2)
+
+    # the snapshot adds the open interval of the current state, so the
+    # split always adds up to the request's age
+    rec["updated_at"] = time.time() - 1.0
+    snap = inf.list_inflight()[0]
+    assert snap["held_seconds"] == pytest.approx(6.0, abs=0.3)
+    assert snap["upstream_seconds"] == pytest.approx(3.0, abs=0.2)
+    assert snap["held_seconds"] + snap["upstream_seconds"] == pytest.approx(
+        snap["age_seconds"], abs=0.2)
+
+
+def test_inflight_waiting_state_adds_to_no_bucket():
+    """The time between gates ("waiting") grows only the total: leaving it
+    adds nothing, and its open interval is in neither bucket."""
+    inf = InFlight()
+    rec = inf.add("r2", model="m", path="/v1/chat/completions", stream=False)
+    rec["updated_at"] = time.time() - 2.0  # 2s spent waiting
+    inf.set_state(rec, "paused")
+    assert rec["held_seconds"] == 0.0
+    assert rec["upstream_seconds"] == 0.0
+
+    # now paused is open for 0.5s — the snapshot counts it as held
+    rec["updated_at"] = time.time() - 0.5
+    snap = inf.list_inflight()[0]
+    assert snap["held_seconds"] == pytest.approx(0.5, abs=0.2)
+    assert snap["upstream_seconds"] == 0.0
+
+
+def test_inflight_split_survives_a_pause_and_upstream(tmp_path):
+    """E2E: a limiter-queued request reports held_seconds > 0 while it is
+    held, upstream_seconds > 0 once it reaches the LLM server, and the
+    stats line carries total_seconds plus queued_seconds."""
+    async def main():
+        backend, proxy, calls, release = await _start_gated(tmp_path, 1)
+        holder = task = None
+        try:
+            holder = asyncio.create_task(_send(proxy))
+            await _wait_calls(calls, 1)
+            task = asyncio.create_task(_send(proxy))
+            await asyncio.sleep(0.6)
+
+            rows = {r["id"]: r for r in (await _state(proxy))["in_flight"]}
+            held = next(r for r in rows.values() if r["state"] == "queued")
+            assert held["held_seconds"] > 0.3
+            assert held["upstream_seconds"] == 0
+            # held + upstream = the age, minus the sub-tick gate transits
+            assert held["held_seconds"] + held["upstream_seconds"] \
+                > held["age_seconds"] - 0.05
+
+            await release()                # holder leaves, queue is admitted
+            await _wait_calls(calls, 2)
+            await asyncio.sleep(0.3)
+            rows = {r["id"]: r for r in (await _state(proxy))["in_flight"]}
+            up = rows[held["id"]]
+            assert up["state"] == "upstream"
+            assert up["upstream_seconds"] > 0
+            assert up["held_seconds"] == pytest.approx(
+                held["held_seconds"], abs=0.5)
+
+            await release()
+            async with await asyncio.wait_for(task, 5) as r:
+                assert r.status == 200
+            async with await asyncio.wait_for(holder, 5) as r:
+                assert r.status == 200
+
+            lines = (tmp_path / "stats.jsonl").read_text(
+                encoding="utf-8").splitlines()
+            entries = [json.loads(l) for l in lines if l.strip()]
+            assert len(entries) == 2
+            queued = [e for e in entries if e.get("queued_seconds")]
+            assert len(queued) == 1, "only the held request carries the field"
+            assert queued[0]["total_seconds"] >= queued[0]["queued_seconds"]
+            assert queued[0]["total_seconds"] > 0
         finally:
             for t in (task, holder):
                 if t is not None:
