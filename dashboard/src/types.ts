@@ -83,7 +83,7 @@ export interface Concurrency {
 export interface ProxyEvent {
   /** unix seconds (float) */
   ts: number;
-  /** "pause" | "resume" | backend-specific extras */
+  /** "pause" | "resume" | "drop" | backend-specific extras */
   action: string;
 }
 

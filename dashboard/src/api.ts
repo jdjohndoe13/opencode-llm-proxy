@@ -303,6 +303,17 @@ export async function resume(): Promise<ToggleResult> {
   return { ok: bool(o['ok'], true), paused: bool(o['paused'], false) };
 }
 
+/**
+ * POST /drop — severs every in-flight connection without any response
+ * (a network-loss simulation). Destructive: the client arms it behind a
+ * two-step confirm. `dropped` is how many connections the proxy killed.
+ */
+export async function dropInFlight(): Promise<{ ok: boolean; dropped: number }> {
+  const o = obj(await postJson('/drop'));
+  const n = num(o['dropped']);
+  return { ok: bool(o['ok'], true), dropped: n < 0 ? 0 : Math.round(n) };
+}
+
 /** POST /tempguard — flips user_enabled. Returns the new effective value. */
 export async function setTempGuard(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
   const o = obj(await postJson('/tempguard', { enabled }));

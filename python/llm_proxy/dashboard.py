@@ -6,6 +6,7 @@ the backend):
   GET  /api/dashboard/state     pause state + in-flight + keepalive + events
   POST /api/dashboard/pause     pause the proxy (in-flight requests keep going)
   POST /api/dashboard/resume    resume the proxy
+  POST /api/dashboard/drop      sever every in-flight request (client sees RST)
   GET  /api/dashboard/history   paginated stats.jsonl tail, newest first
   POST /api/dashboard/tempguard             on/off for the temperature guard
   POST /api/dashboard/tempguard/thresholds  edit the hysteresis pair
@@ -180,6 +181,20 @@ async def resume(request: web.Request) -> web.Response:
     gate: PauseGate = request.app["pause_gate"]
     gate.resume()
     return _json({"ok": True, "paused": False})
+
+
+async def drop(request: web.Request) -> web.Response:
+    """POST /api/dashboard/drop — sever every in-flight request.
+
+    No forwarding, no response: the client connection is aborted (RST) so
+    the caller sees a connection error, exactly as if the proxy lost its
+    network. The pause state is untouched; the event feed records the drop
+    count."""
+    n = await request.app["inflight"].drop_all()
+    gate: PauseGate = request.app["pause_gate"]
+    gate.record_action("drop")
+    log.info("dropped %s in-flight request(s)", n)
+    return _json({"ok": True, "dropped": n})
 
 
 async def history(request: web.Request) -> web.Response:
@@ -370,6 +385,7 @@ def register(app: web.Application) -> None:
     r.add_route("*", "/api/dashboard/state", _api(state))
     r.add_route("*", "/api/dashboard/pause", _api(pause))
     r.add_route("*", "/api/dashboard/resume", _api(resume))
+    r.add_route("*", "/api/dashboard/drop", _api(drop))
     r.add_route("*", "/api/dashboard/history", _api(history))
     r.add_route("*", "/api/dashboard/tempguard", _api(tempguard))
     r.add_route("*", "/api/dashboard/tempguard/thresholds",

@@ -4,13 +4,13 @@
  * One static DOM skeleton, one 1s tick:
  *   - every tick: clock, interpolated ages, pause duration, button hint
  *   - every 2s:   GET /state (and GET /history when its params changed)
- *   - POST /pause|/resume behind a two-step confirm button
+ *   - POST /pause|/resume|/drop behind a two-step confirm button
  *
  * All rendering is defensive: if the API is down the UI keeps the last
  * known state, flags it stale, and shows a "proxy unreachable" banner.
  */
 import './styles.css';
-import { ApiError, fetchHistory, fetchState, pause, resume, setConcurrency, setTempGuard, setTempThresholds } from './api';
+import { ApiError, dropInFlight, fetchHistory, fetchState, pause, resume, setConcurrency, setTempGuard, setTempThresholds } from './api';
 import {
   fmtAgo,
   fmtClock,
@@ -38,6 +38,15 @@ let ageOffsetMs = 0; // ms since last /state → interpolate ages between polls
 let confirmTimer = 0;
 let actionPending = false;
 let guardPending = false;
+
+/* Drop-in-flight control — its own two-step timer and in-flight flag so it
+ * can never fight the pause button's `confirmTimer` / `actionPending`.
+ * `dropDoneAt` + `dropDoneN` drive the short-lived "DROPPED n" feedback. */
+let dropConfirmTimer = 0;
+let dropPending = false;
+let dropDoneAt = 0;
+let dropDoneN = 0;
+const DROP_DONE_MS = 2500;
 
 /* Threshold editor. `thrLive` is the pair the guard is applying right now
  * (shown in the "now" readout, never edited by typing). `thrDirty` means
@@ -118,9 +127,15 @@ app.innerHTML = `
         <div class="state-detail" id="state-detail">connecting to proxy…</div>
       </div>
     </div>
-    <button class="pause-btn" id="pause-btn" type="button" disabled>
-      <span id="btn-label">···</span>
-    </button>
+    <div class="hero-actions">
+      <button class="pause-btn" id="pause-btn" type="button" disabled>
+        <span id="btn-label">···</span>
+      </button>
+      <button class="drop-btn" id="drop-btn" type="button" disabled
+              title="Sever every in-flight connection with no response — a network-loss simulation. The clients see a dead connection.">
+        <span id="drop-label">···</span>
+      </button>
+    </div>
   </section>
 
   <section class="tg-strip" id="tg-strip" hidden>
@@ -272,6 +287,8 @@ const stateLabel = $<HTMLDivElement>('#state-label');
 const stateDetail = $<HTMLDivElement>('#state-detail');
 const pauseBtn = $<HTMLButtonElement>('#pause-btn');
 const btnLabel = $<HTMLSpanElement>('#btn-label');
+const dropBtn = $<HTMLButtonElement>('#drop-btn');
+const dropLabel = $<HTMLSpanElement>('#drop-label');
 const iflightCount = $<HTMLSpanElement>('#iflight-count');
 const iflightBody = $<HTMLTableSectionElement>('#iflight-body');
 const iflightEmpty = $<HTMLDivElement>('#iflight-empty');
@@ -485,34 +502,87 @@ function renderHero(): void {
   stateDetail.innerHTML = parts.join(' · ');
 }
 
+/** Shared disabled/busy chrome for the two hero controls. The state
+ * classes themselves are owned by the caller's own state branches. */
+function heroAction(
+  busy: boolean,
+  disabled: boolean,
+  label: string,
+  labelEl: HTMLSpanElement,
+  btn: HTMLButtonElement,
+): void {
+  if (busy) {
+    btn.disabled = true;
+    btn.classList.add('busy');
+    labelEl.textContent = '··· WORKING';
+    return;
+  }
+  btn.classList.remove('busy');
+  if (conn === 'down' || !state) {
+    btn.disabled = true;
+    labelEl.textContent = 'PROXY UNREACHABLE';
+    return;
+  }
+  btn.disabled = disabled;
+  labelEl.textContent = label;
+}
+
 function renderButton(): void {
   if (actionPending) {
-    pauseBtn.disabled = true;
-    pauseBtn.classList.add('busy');
     pauseBtn.classList.remove('confirming', 'propose-pause', 'propose-resume');
-    btnLabel.textContent = '··· WORKING';
+    heroAction(true, true, '', btnLabel, pauseBtn);
     return;
   }
-  pauseBtn.classList.remove('busy');
   if (conn === 'down' || !state) {
-    pauseBtn.disabled = true;
     pauseBtn.classList.remove('confirming', 'propose-pause', 'propose-resume');
-    btnLabel.textContent = 'PROXY UNREACHABLE';
+    heroAction(false, true, '', btnLabel, pauseBtn);
     return;
   }
-  pauseBtn.disabled = false;
   if (state.paused) {
     pauseBtn.classList.remove('confirming', 'propose-pause');
     pauseBtn.classList.add('propose-resume');
-    btnLabel.textContent = '▶ RESUME TRAFFIC';
+    heroAction(false, false, '▶ RESUME TRAFFIC', btnLabel, pauseBtn);
   } else if (pauseBtn.classList.contains('confirming')) {
     pauseBtn.classList.remove('propose-pause');
     pauseBtn.classList.add('confirming');
-    btnLabel.textContent = '⚠ CONFIRM — HOLD ALL';
+    heroAction(false, false, '⚠ CONFIRM — HOLD ALL', btnLabel, pauseBtn);
   } else {
     pauseBtn.classList.remove('propose-resume', 'confirming');
     pauseBtn.classList.add('propose-pause');
-    btnLabel.textContent = '❚❚ PAUSE TRAFFIC';
+    heroAction(false, false, '❚❚ PAUSE TRAFFIC', btnLabel, pauseBtn);
+  }
+}
+
+/** Destructive sibling of the pause button: severs every in-flight
+ * connection. Nothing to drop → nothing to press. */
+function renderDrop(): void {
+  if (dropPending) {
+    dropBtn.classList.remove('confirming', 'propose-drop');
+    heroAction(true, true, '', dropLabel, dropBtn);
+    return;
+  }
+  if (conn === 'down' || !state) {
+    dropBtn.classList.remove('confirming', 'propose-drop');
+    heroAction(false, true, '', dropLabel, dropBtn);
+    return;
+  }
+  const n = state.in_flight.length;
+  if (n === 0) {
+    // nothing to drop — except the brief "DROPPED n" receipt, which is
+    // truthy for a moment after the connections are gone
+    const done = dropDoneAt > 0 && performance.now() - dropDoneAt < DROP_DONE_MS;
+    dropBtn.classList.remove('confirming', 'propose-drop');
+    heroAction(false, true, done ? `DROPPED ${dropDoneN}` : '✖ DROP IN-FLIGHT (0)', dropLabel, dropBtn);
+    return;
+  }
+  if (dropBtn.classList.contains('confirming')) {
+    dropBtn.classList.remove('propose-drop');
+    dropBtn.classList.add('confirming');
+    heroAction(false, false, '⚠ CONFIRM — DROP ALL', dropLabel, dropBtn);
+  } else {
+    dropBtn.classList.remove('confirming');
+    dropBtn.classList.add('propose-drop');
+    heroAction(false, false, `✖ DROP IN-FLIGHT (${n})`, dropLabel, dropBtn);
   }
 }
 
@@ -817,7 +887,10 @@ function renderFooter(): void {
     fEvents.appendChild(el('span', 'dim', 'none recorded'));
   }
   for (const ev of evs) {
-    const kind = ev.action === 'pause' ? 'pause' : ev.action === 'resume' ? 'resume' : 'other';
+    const kind =
+      ev.action === 'pause' ? 'pause' :
+      ev.action === 'resume' ? 'resume' :
+      ev.action === 'drop' ? 'drop' : 'other';
     const chip = el('span', `ev ${kind}`);
     chip.appendChild(el('span', 'ev-dot'));
     chip.appendChild(el('span', undefined, ev.action));
@@ -874,6 +947,7 @@ async function pollState(): Promise<void> {
   renderHero();
   renderInflight();
   renderButton();
+  renderDrop();
   renderTempGuard();
   renderConcurrency();
   renderFooter();
@@ -910,6 +984,14 @@ function clearConfirm(): void {
     confirmTimer = 0;
   }
   pauseBtn.classList.remove('confirming');
+}
+
+function clearDropConfirm(): void {
+  if (dropConfirmTimer) {
+    window.clearTimeout(dropConfirmTimer);
+    dropConfirmTimer = 0;
+  }
+  dropBtn.classList.remove('confirming');
 }
 
 pauseBtn.addEventListener('click', () => {
@@ -949,6 +1031,42 @@ pauseBtn.addEventListener('click', () => {
     })
     .finally(() => {
       actionPending = false;
+      void pollState();
+    });
+});
+
+dropBtn.addEventListener('click', () => {
+  if (!state || dropPending || conn === 'down') return;
+  if (state.in_flight.length === 0) return; // nothing to sever
+
+  if (!dropBtn.classList.contains('confirming')) {
+    // step 1 of 2: the button becomes the warning before the severing
+    dropBtn.classList.add('confirming');
+    dropLabel.textContent = '⚠ CONFIRM — DROP ALL';
+    dropConfirmTimer = window.setTimeout(() => {
+      clearDropConfirm();
+      renderDrop();
+    }, CONFIRM_MS);
+    return;
+  }
+
+  clearDropConfirm();
+  dropPending = true;
+  renderDrop();
+  dropInFlight()
+    .then((res) => {
+      if (res.ok) {
+        // brief receipt: the in-flight table empties, so the count the
+        // button used to show would otherwise vanish with it
+        dropDoneAt = performance.now();
+        dropDoneN = res.dropped;
+      }
+    })
+    .catch((err) => {
+      setConnDown(err);
+    })
+    .finally(() => {
+      dropPending = false;
       void pollState();
     });
 });
@@ -1188,6 +1306,7 @@ function tick(): void {
 
   for (const row of iflightRows.values()) tickAge(row, row.baseAge, row.baseAt);
   renderHero();
+  renderDrop(); // expire the "DROPPED n" receipt without waiting for a poll
   renderSync();
   tickChecked();
 }

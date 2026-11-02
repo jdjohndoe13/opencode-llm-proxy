@@ -260,6 +260,12 @@ async def completions(request: web.Request) -> web.StreamResponse:
         path=request.path,
         stream=want_stream)
     ctx["_inflight"] = rec
+    # Kill handles for the dashboard's "drop all" (see inflight.drop_all):
+    # the handler task + the client transport. The private side-map keeps
+    # them out of the JSON the dashboard polls. Keyed by the record's own
+    # id — add() suffixes it so same-millisecond requests cannot collide.
+    inflight.register_kill(rec["id"], ctx, request.transport,
+                           asyncio.current_task())
 
     # Manual pause gate (before the temp guard and the upstream): while
     # paused the upstream is never touched — no connect attempts at all.

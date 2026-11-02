@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -34,9 +35,9 @@ def _cfg(tmp_path, backend, **over):
     return load(env)
 
 
-async def _start(tmp_path, handler=None, over=None):
+async def _start(tmp_path, handler=None, over=None, hc=False):
     """Proxy + mock backend that records call count. Returns (backend,
-    proxy, calls)."""
+    proxy, calls). hc=True mirrors production's handler_cancellation."""
     calls = {"n": 0}
 
     async def chat(request):
@@ -50,7 +51,8 @@ async def _start(tmp_path, handler=None, over=None):
     backend = TestServer(backend_app)
     await backend.start_server()
     cfg = _cfg(tmp_path, f"127.0.0.1:{backend.port}", **(over or {}))
-    proxy = TestClient(TestServer(create_app(cfg)))
+    runner_kw = {"handler_cancellation": True} if hc else {}
+    proxy = TestClient(TestServer(create_app(cfg), **runner_kw))
     await proxy.start_server()
     return backend, proxy, calls
 
@@ -67,11 +69,28 @@ async def _resume(proxy):
         assert await r.json() == {"ok": True, "paused": False}
 
 
+async def _drop(proxy):
+    async with proxy.post("/api/dashboard/drop") as r:
+        assert r.status == 200
+        assert r.headers.get("Access-Control-Allow-Origin") == "*"
+        return await r.json()
+
+
 async def _state(proxy):
     async with proxy.get("/api/dashboard/state") as r:
         assert r.status == 200
         assert r.headers.get("Access-Control-Allow-Origin") == "*"
         return await r.json()
+
+
+async def _gone(coro):
+    """Await a request we expect to be severed: the client must see a
+    connection error, not a response."""
+    try:
+        r = await coro
+    except (aiohttp.ClientError, OSError):
+        return
+    assert False, f"dropped request must not answer, got HTTP {r.status}"
 
 
 async def _collect(resp):
@@ -706,3 +725,263 @@ def test_validate_thresholds():
     assert "finite" in validate_thresholds(74, float("inf"))
     assert "finite" in validate_thresholds("74", 60)   # str
     assert "finite" in validate_thresholds(74, True)   # bool is not a number
+
+
+# ------------------------------------------------------------------ drop all
+
+def _slow_backend(delay=2.0):
+    """Mock backend handler: counts its invocations and stalls, so the
+    proxy is provably mid-upstream when the drop lands. The stall is
+    cancellable, so a cancelled upstream fetch also stops the backend."""
+    seen = {"n": 0}
+
+    async def handler(request):
+        seen["n"] += 1
+        await asyncio.sleep(delay)
+        return web.json_response(CHAT)
+
+    return handler, seen
+
+
+async def _wait_empty(proxy, timeout=5.0):
+    """Poll /state until the registry is empty (drop_all already waits
+    for the handlers to unwind, but the client-side teardown is not
+    synchronous with the response)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        st = await _state(proxy)
+        if not st["in_flight"]:
+            return
+        if loop.time() >= deadline:
+            assert False, f"registry must be clean, still: {st['in_flight']}"
+        await asyncio.sleep(0.05)
+
+
+def test_inflight_add_ids_are_unique_within_a_millisecond():
+    """The caller's rec_id is a ms timestamp; two requests in the same ms
+    must NOT overwrite each other's record or kill entry (point 8)."""
+    from llm_proxy.inflight import InFlight
+
+    reg = InFlight()
+    a = reg.add("1700000000000", model="m", path="/v1/completions",
+                stream=False)
+    b = reg.add("1700000000000", model="m", path="/v1/completions",
+                stream=False)
+    assert a["id"] != b["id"], "same-ms ids must not collide"
+    assert len(reg.list_inflight()) == 2
+    # Kill entries keyed by the record's own id stay separate too.
+    reg.register_kill(a["id"], {}, None, None)
+    reg.register_kill(b["id"], {}, None, None)
+    assert len(reg._kill) == 2
+    reg.remove(a["id"])
+    assert len(reg._kill) == 1
+    assert [r["id"] for r in reg.list_inflight()] == [b["id"]]
+
+
+def test_drop_nonstream_mid_upstream(tmp_path):
+    """POST /api/dashboard/drop while a request is mid-upstream: the client
+    gets a connection error (RST, no response), the registry empties, the
+    proxy lives and answers the next request. The proxy runs with
+    handler_cancellation=True like production (web.run_app)."""
+    async def main():
+        slow, seen = _slow_backend()
+        backend, proxy, calls = await _start(tmp_path, handler=slow, hc=True)
+        try:
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            await asyncio.sleep(0.3)      # inside the upstream call
+            assert calls["n"] == 1
+            st = await _state(proxy)
+            assert len(st["in_flight"]) == 1
+            assert st["in_flight"][0]["state"] == "upstream"
+
+            out = await _drop(proxy)
+            assert out == {"ok": True, "dropped": 1}
+
+            # The client sees the severed connection, not a response.
+            await _gone(asyncio.wait_for(task, 10))
+
+            # drop_all already waited for the handlers, so the registry is
+            # empty by the time the drop response was sent; the poll is
+            # belt-and-braces, not a sleep.
+            await _wait_empty(proxy)
+            st = await _state(proxy)
+            assert st["in_flight"] == []
+            async with proxy.get("/health") as h:
+                assert h.status == 200
+                assert await h.text() == "ok"
+
+            # The proxy answers the NEXT request, and the dropped one never
+            # resurfaces (one call per client request).
+            async with await asyncio.wait_for(
+                    proxy.post("/v1/chat/completions",
+                               json={"model": "m", "stream": False}), 5) as r:
+                assert r.status == 200
+                assert (await r.json())["object"] == "chat.completion"
+            assert calls["n"] == 2
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_drop_stream_after_handshake_commit(tmp_path):
+    """stream:true whose deferred SSE handshake already committed (heartbeat
+    received): the drop kills the connection mid-body, the stream never
+    completes with [DONE], and the registry empties."""
+    async def main():
+        slow, seen = _slow_backend()
+        backend, proxy, calls = await _start(tmp_path, handler=slow, hc=True)
+        try:
+            r = await proxy.post("/v1/chat/completions",
+                                 json={"model": "m", "stream": True})
+            assert r.status == 200
+            assert r.headers["Content-Type"] == "text/event-stream"
+            first = (await asyncio.wait_for(r.content.read(4096), 5)).decode()
+            assert _is_heartbeat(first.splitlines()[0])
+            assert calls["n"] == 1
+
+            out = await _drop(proxy)
+            assert out == {"ok": True, "dropped": 1}
+
+            whole = first
+            try:
+                whole += await _collect(r)
+                assert False, "dropped stream must not complete"
+            except (aiohttp.ClientError, OSError):
+                pass
+            assert not whole.rstrip().endswith("data: [DONE]")
+            assert _content_of(whole) == ""
+
+            await _wait_empty(proxy)
+            async with proxy.get("/health") as h:
+                assert h.status == 200
+            # The dropped upstream fetch died with the handler: the backend
+            # call count stopped growing (no task.cancelled() race).
+            assert calls["n"] == 1, "the cancelled upstream fetch must die too"
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_drop_request_held_by_pause_gate(tmp_path):
+    """A request held by the pause gate (state "paused") is dropped too:
+    the client sees the connection error, the registry empties, and the
+    pause state itself is untouched. A pre-upstream drop writes NO stats
+    line (write_stats returns early without _sent_at) — deliberately not
+    asserted here."""
+    async def main():
+        backend, proxy, calls = await _start(tmp_path, hc=True)
+        try:
+            await _pause(proxy)
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 1.5)
+                assert False, "paused request must not respond"
+            except asyncio.TimeoutError:
+                pass
+            st = await _state(proxy)
+            assert st["in_flight"][0]["state"] == "paused"
+            assert calls["n"] == 0
+
+            out = await _drop(proxy)
+            assert out == {"ok": True, "dropped": 1}
+
+            await _gone(asyncio.wait_for(task, 10))
+
+            await _wait_empty(proxy)
+            st = await _state(proxy)
+            assert st["paused"] is True, "the drop does not resume the proxy"
+            assert st["paused_at"] is not None
+            async with proxy.get("/health") as h:
+                assert h.status == 200
+            # The gate is still armed: resume, and a fresh request works.
+            await _resume(proxy)
+            async with await asyncio.wait_for(
+                    proxy.post("/v1/chat/completions",
+                               json={"model": "m", "stream": False}), 10) as r:
+                assert r.status == 200
+                assert (await r.json())["object"] == "chat.completion"
+            assert calls["n"] == 1
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_drop_with_no_inflight(tmp_path):
+    """Nothing in flight: the endpoint is a no-op."""
+    async def main():
+        backend, proxy, _ = await _start(tmp_path, hc=True)
+        try:
+            assert await _drop(proxy) == {"ok": True, "dropped": 0}
+            # The action is still recorded on the event feed.
+            assert [e["action"] for e in (await _state(proxy))["events"]] \
+                == ["drop"]
+            async with proxy.get("/health") as h:
+                assert h.status == 200
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_drop_reports_count_and_records_event(tmp_path):
+    """The dropped count matches the in-flight list, the event feed carries
+    the drop, and the kill map is not left behind (second drop = 0)."""
+    async def main():
+        slow, seen = _slow_backend()
+        backend, proxy, calls = await _start(tmp_path, handler=slow, hc=True)
+        try:
+            t1 = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            await asyncio.sleep(0.1)
+            t2 = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": True}))
+            await asyncio.sleep(0.3)
+            assert calls["n"] == 2
+            assert len((await _state(proxy))["in_flight"]) == 2
+
+            out = await _drop(proxy)
+            assert out["ok"] is True
+            assert out["dropped"] == 2
+            st = await _state(proxy)
+            assert [e["action"] for e in st["events"]] == ["drop"]
+            assert isinstance(st["events"][0]["ts"], (int, float))
+
+            for t in (t1, t2):
+                try:
+                    await t
+                except (aiohttp.ClientError, OSError):
+                    pass
+            await _wait_empty(proxy)
+            # A second drop has nothing left to drop: the kill map went too.
+            assert await _drop(proxy) == {"ok": True, "dropped": 0}
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())
+
+
+def test_drop_preflight_does_not_drop(tmp_path):
+    """The CORS preflight must not trigger the drop (the _api guard)."""
+    async def main():
+        slow, seen = _slow_backend()
+        backend, proxy, calls = await _start(tmp_path, handler=slow, hc=True)
+        try:
+            task = asyncio.create_task(
+                proxy.post("/v1/chat/completions",
+                           json={"model": "m", "stream": False}))
+            await asyncio.sleep(0.3)
+            assert calls["n"] == 1
+            async with proxy.options("/api/dashboard/drop") as r:
+                assert r.status == 204
+            async with await asyncio.wait_for(task, 10) as r:
+                assert r.status == 200
+                assert (await r.json())["object"] == "chat.completion"
+            assert calls["n"] == 1
+        finally:
+            await proxy.close(); await backend.close()
+    asyncio.run(main())

@@ -183,6 +183,15 @@ body::before {
   align-items: stretch;
 }
 
+/* the two big controls share the hero's right column and stay the same
+ * height; the row wraps (see the narrow-screen rule) so it never squeezes
+ * the state card into unreadability */
+.hero-actions {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+
 .state-card {
   border: 1px solid var(--line);
   border-left: 3px solid var(--green);
@@ -259,30 +268,37 @@ body::before {
   color: var(--amber);
 }
 
-/* ---------- the big button ---------- */
+/* ---------- the big buttons ---------- */
 
-.pause-btn {
+/* Shared chrome for the hero's two big controls; colour lives in the
+ * per-button rules below. */
+.pause-btn,
+.drop-btn {
   font-family: var(--mono);
   font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.18em;
   text-transform: uppercase;
-  color: #06100b;
-  background: linear-gradient(180deg, #43e79a, #29b571);
-  border: 1px solid #57f0aa;
+  border: 1px solid;
   border-radius: 8px;
   padding: 0 34px;
   min-width: 240px;
   cursor: pointer;
   position: relative;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.25),
-    0 4px 18px rgba(53, 217, 140, 0.25);
   transition: transform 0.08s, box-shadow 0.2s, filter 0.2s;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
+}
+
+.pause-btn {
+  color: #06100b;
+  background: linear-gradient(180deg, #43e79a, #29b571);
+  border-color: #57f0aa;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    0 4px 18px rgba(53, 217, 140, 0.25);
 }
 
 .pause-btn small {
@@ -301,7 +317,8 @@ body::before {
     0 6px 26px rgba(53, 217, 140, 0.4);
 }
 
-.pause-btn:active:not(:disabled) {
+.pause-btn:active:not(:disabled),
+.drop-btn:active:not(:disabled) {
   transform: translateY(1px);
 }
 
@@ -309,6 +326,46 @@ body::before {
   cursor: not-allowed;
   filter: saturate(0.35) brightness(0.6);
   box-shadow: none;
+}
+
+/* the drop control: destructive like the pause button, but a different
+ * kind of dangerous — a dark severance switch with hazard striping and a
+ * red knife-edge border, so it never reads as a second copy of the green
+ * or red traffic control. */
+.drop-btn {
+  font-size: 14px;
+  letter-spacing: 0.16em;
+  min-width: 216px;
+  padding: 0 24px;
+  color: #ff9d94;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 93, 85, 0.06) 0 10px,
+      transparent 10px 20px
+    ),
+    linear-gradient(180deg, #1d1011, #140b0b);
+  border-color: rgba(255, 93, 85, 0.55);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 4px 18px rgba(255, 93, 85, 0.14);
+}
+
+.drop-btn:hover:not(:disabled) {
+  color: #ffd9d5;
+  border-color: var(--red);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 6px 26px rgba(255, 93, 85, 0.35);
+}
+
+/* nothing to sever — the dashed border reads as an empty switch, in the
+ * same dialect as .tg-state.inactive */
+.drop-btn:disabled {
+  cursor: not-allowed;
+  filter: saturate(0.3) brightness(0.8);
+  box-shadow: none;
+  border-style: dashed;
 }
 
 /* when proxy is RUNNING, the button proposes PAUSE (dangerous action) */
@@ -334,8 +391,10 @@ body::before {
   border-color: #57f0aa;
 }
 
-/* two-step confirmation state: the button becomes the warning */
-.pause-btn.confirming {
+/* two-step confirmation state: the button becomes the warning — shared
+ * by both hero controls, so the pause and drop arms look identical */
+.pause-btn.confirming,
+.drop-btn.confirming {
   color: #1a0e00;
   background: repeating-linear-gradient(
     -45deg,
@@ -343,6 +402,7 @@ body::before {
     #f5a335 14px 28px
   );
   border-color: #ffd08a;
+  border-style: solid;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.3),
     0 4px 22px rgba(255, 180, 84, 0.35);
@@ -354,7 +414,8 @@ body::before {
   to { transform: none; }
 }
 
-.pause-btn.busy {
+.pause-btn.busy,
+.drop-btn.busy {
   animation: busy 0.8s ease-in-out infinite;
 }
 
@@ -1059,6 +1120,9 @@ td.held {
 .ev.pause { color: var(--red); border-color: rgba(255, 93, 85, 0.35); }
 .ev.resume .ev-dot { background: var(--green); }
 .ev.resume { color: var(--green); border-color: rgba(53, 217, 140, 0.35); }
+/* severed connections: the harshest event, so the purest red */
+.ev.drop .ev-dot { background: var(--red); }
+.ev.drop { color: var(--red); border-color: rgba(255, 93, 85, 0.6); background: var(--red-glow); }
 .ev.other .ev-dot { background: var(--ink-faint); }
 .ev .ev-when {
   color: var(--ink-faint);
@@ -1090,11 +1154,28 @@ td.held {
   border-radius: 4px;
 }
 
+/* mid widths: the two big buttons stack in the right column instead of
+ * squeezing the state card — the hero row stays readable */
+@media (max-width: 1020px) {
+  .hero-actions {
+    flex-direction: column;
+  }
+  .pause-btn,
+  .drop-btn {
+    min-width: 0;
+    padding: 0 22px;
+  }
+}
+
 @media (max-width: 760px) {
   .hero {
     grid-template-columns: 1fr;
   }
-  .pause-btn {
+  .hero-actions {
+    flex-direction: column;
+  }
+  .pause-btn,
+  .drop-btn {
     min-width: 0;
     padding: 16px 0;
   }

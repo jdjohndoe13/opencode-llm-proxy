@@ -274,10 +274,11 @@ timestamp in their name. The `.gitignore` excludes the dump files. Dump
 write failures are logged to nginx's error log and never affect the proxied
 response.
 
-## Dashboard: pause / resume (Python service)
+## Dashboard: pause / resume / drop (Python service)
 
 The Python service serves a small ops dashboard at
-`http://localhost:9999/dashboard` with a pause/resume switch:
+`http://localhost:9999/dashboard` with a pause/resume switch and a
+drop button:
 
 - **Pause** — in-flight requests keep being served normally. Every *new*
   `/v1/completions` / `/v1/chat/completions` request is held without ever
@@ -287,6 +288,14 @@ The Python service serves a small ops dashboard at
   resumed or the client's own timeout fires.
 - **Resume** — the held requests are released and proceed normally
   (temp guard, then upstream).
+- **Drop in-flight** — the opposite of pause: every request currently in
+  the proxy (held at any gate or already at the backend) is killed
+  without a response. The client connection is aborted outright, so the
+  client sees a connection error — exactly as if the machine running the
+  proxy had lost its network. The backend is never told about the
+  dropped requests (the upstream fetch is cancelled with the handler),
+  and each one is logged to `stats.jsonl` with status `444` like any
+  other aborted request.
 
 The intended workflow: pause the proxy, reboot the LLM server, resume
 when the new server is up. Clients only ever see "the server is slow",
@@ -295,7 +304,7 @@ dies still fail — nothing the proxy can do about that.) The pause state
 is in-memory only: a proxy restart always boots running.
 
 The dashboard shows the pause state, live in-flight requests (model,
-stream, duration with the held/processed split, waiting/paused/stalled/queued/upstream), the recent pause/resume
+stream, duration with the held/processed split, waiting/paused/stalled/queued/upstream), the recent pause/resume/drop
 events and the paginated request history read from `logs/stats.jsonl`
 (newest first; `paused_seconds`, `queued_seconds` and `total_seconds` are
 recorded per request). Each duration cell reads
@@ -309,6 +318,12 @@ API (plain JSON, no auth — localhost tool):
 GET  /api/dashboard/state              paused, in-flight, keepalive, temp guard, events
 POST /api/dashboard/pause              pause the proxy
 POST /api/dashboard/resume             resume the proxy
+POST /api/dashboard/drop               drop every in-flight request: the
+                                       clients' connections are aborted
+                                       without any response (network-loss
+                                       simulation); returns
+                                       {"ok":true,"dropped":n} and logs
+                                       a "drop" event
 POST /api/dashboard/tempguard          {"enabled": true|false} — runtime switch
                                        for the GPU temperature guard (the
                                        guard re-arms on proxy restart)

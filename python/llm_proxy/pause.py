@@ -52,6 +52,11 @@ class PauseGate:
     def _record(self, action: str, ts: float) -> None:
         self._events.append({"ts": ts, "action": action})
 
+    def record_action(self, action: str, ts: float | None = None) -> None:
+        """Log a non-pause dashboard action (e.g. "drop") on the same event
+        feed, so the UI shows it in order alongside pause/resume."""
+        self._record(action, time.time() if ts is None else ts)
+
     def events(self) -> list[dict]:
         """Recent pause/resume events, newest first."""
         return list(reversed(self._events))
