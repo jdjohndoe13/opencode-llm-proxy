@@ -25,9 +25,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Archive      = 'B:\intersub\temp\llm-proxy-logs-261027.7z',
+    [string]$Archive      = 'b:\intersub\temp\llm-proxy-logs-261103.7z',
     [string]$LogsDir      = 'B:\intersub\temp\llm-proxy\logs',
-    [string]$PasswordFile = 'B:\intersub\temp\llm-proxy-logs-261027-password.txt',
+    [string]$PasswordFile = 'B:\intersub\temp\llm-proxy-logs-password.txt',
     [string]$SevenZip     = 'C:\Program Files\7-Zip\7z.exe',
     [int]$WaitForPasswordSeconds = 600,
     # Only files whose name ends with one of these suffixes are deleted.
